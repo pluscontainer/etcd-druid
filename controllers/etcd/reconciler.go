@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"reflect"
 
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	"github.com/gardener/etcd-druid/controllers/utils"
@@ -26,6 +25,8 @@ import (
 	componentconfigmap "github.com/gardener/etcd-druid/pkg/component/etcd/configmap"
 	componentlease "github.com/gardener/etcd-druid/pkg/component/etcd/lease"
 	componentpdb "github.com/gardener/etcd-druid/pkg/component/etcd/poddisruptionbudget"
+	componentrole "github.com/gardener/etcd-druid/pkg/component/etcd/role"
+	componentrolebinding "github.com/gardener/etcd-druid/pkg/component/etcd/rolebinding"
 	componentservice "github.com/gardener/etcd-druid/pkg/component/etcd/service"
 	componentserviceaccount "github.com/gardener/etcd-druid/pkg/component/etcd/serviceaccount"
 	componentsts "github.com/gardener/etcd-druid/pkg/component/etcd/statefulset"
@@ -39,7 +40,6 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbac "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -271,6 +271,22 @@ func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl
 		}, err
 	}
 
+	roleValues := componentrole.GenerateValues(etcd)
+	roleDeployer := componentrole.New(r.Client, roleValues)
+	if err := roleDeployer.Destroy(ctx); err != nil {
+		return ctrl.Result{
+			Requeue: true,
+		}, err
+	}
+
+	roleBindingValues := componentrolebinding.GenerateValues(etcd)
+	roleBindingDeployer := componentrolebinding.New(r.Client, roleBindingValues)
+	if err := roleBindingDeployer.Destroy(ctx); err != nil {
+		return ctrl.Result{
+			Requeue: true,
+		}, err
+	}
+
 	if sets.NewString(etcd.Finalizers...).Has(common.FinalizerName) {
 		logger.Info("Removing finalizer")
 		if err := controllerutils.RemoveFinalizers(ctx, r.Client, etcd, common.FinalizerName); client.IgnoreNotFound(err) != nil {
@@ -281,73 +297,6 @@ func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl
 	}
 	logger.Info("Deleted etcd successfully.")
 	return ctrl.Result{}, nil
-}
-
-func (r *Reconciler) reconcileRole(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd, values map[string]interface{}) error {
-	logger.Info("Reconciling role")
-	var err error
-
-	decoded, err := r.chart.decodeRole(etcd.Name, etcd.Namespace, values)
-	if err != nil {
-		return err
-	}
-
-	roleObj := &rbac.Role{}
-	key := client.ObjectKeyFromObject(decoded)
-	if err := r.Get(ctx, key, roleObj); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		if err := r.Create(ctx, decoded); err != nil {
-			return err
-		}
-		logger.Info("Creating role", "role", kutil.Key(decoded.Namespace, decoded.Name).String())
-		return nil
-	}
-
-	if !reflect.DeepEqual(decoded.Rules, roleObj.Rules) {
-		roleObjCopy := roleObj.DeepCopy()
-		roleObjCopy.Rules = decoded.Rules
-		if err := r.Patch(ctx, roleObjCopy, client.MergeFrom(roleObj)); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (r *Reconciler) reconcileRoleBinding(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd, values map[string]interface{}) error {
-	logger.Info("Reconciling rolebinding")
-	var err error
-
-	decoded, err := r.chart.decodeRoleBinding(etcd.Name, etcd.Namespace, values)
-	if err != nil {
-		return err
-	}
-
-	roleBindingObj := &rbac.RoleBinding{}
-	key := client.ObjectKeyFromObject(decoded)
-	if err := r.Get(ctx, key, roleBindingObj); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return err
-		}
-		if err := r.Create(ctx, decoded); err != nil {
-			return err
-		}
-		logger.Info("Creating rolebinding", "rolebinding", kutil.Key(decoded.Namespace, decoded.Name).String())
-		return nil
-	}
-
-	if !reflect.DeepEqual(decoded.RoleRef, roleBindingObj.RoleRef) || !reflect.DeepEqual(decoded.Subjects, roleBindingObj.Subjects) {
-		roleBindingObjCopy := roleBindingObj.DeepCopy()
-		roleBindingObjCopy.RoleRef = decoded.RoleRef
-		roleBindingObjCopy.Subjects = decoded.Subjects
-		if err := r.Patch(ctx, roleBindingObjCopy, client.MergeFrom(roleBindingObj)); err != nil {
-			return err
-		}
-	}
-
-	return err
 }
 
 func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) reconcileResult {
@@ -398,22 +347,21 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 		return reconcileResult{err: err}
 	}
 
-	roleValues, err := r.getMapFromEtcd(etcd, r.config.DisableEtcdServiceAccountAutomount)
+	roleValues := componentrole.GenerateValues(etcd)
+	roleDeployer := componentrole.New(r.Client, roleValues)
+	err = roleDeployer.Deploy(ctx)
 	if err != nil {
 		return reconcileResult{err: err}
 	}
 
-	err = r.reconcileRole(ctx, logger, etcd, roleValues)
+	roleBindingValues := componentrolebinding.GenerateValues(etcd)
+	roleBindingDeployer := componentrolebinding.New(r.Client, roleBindingValues)
+	err = roleBindingDeployer.Deploy(ctx)
 	if err != nil {
 		return reconcileResult{err: err}
 	}
 
-	err = r.reconcileRoleBinding(ctx, logger, etcd, roleValues)
-	if err != nil {
-		return reconcileResult{err: err}
-	}
-
-	peerTLSEnabled, err := leaseDeployer.GetPeerURLTLSEnabledStatus(ctx)
+	peerTLSEnabled, err := druidutils.IsPeerURLTLSEnabled(ctx, r.Client, etcd.Namespace, etcd.Name, logger)
 	if err != nil {
 		return reconcileResult{err: err}
 	}
@@ -441,26 +389,6 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 
 	sts, err := stsDeployer.Get(ctx)
 	return reconcileResult{svcName: &serviceValues.ClientServiceName, sts: sts, err: err}
-}
-
-func (r *Reconciler) getMapFromEtcd(etcd *druidv1alpha1.Etcd, disableEtcdServiceAccountAutomount bool) (map[string]interface{}, error) {
-	pdbMinAvailable := 0
-	if etcd.Spec.Replicas > 1 {
-		pdbMinAvailable = int(etcd.Spec.Replicas)
-	}
-
-	values := map[string]interface{}{
-		"name":                               etcd.Name,
-		"uid":                                etcd.UID,
-		"labels":                             etcd.Spec.Labels,
-		"pdbMinAvailable":                    pdbMinAvailable,
-		"serviceAccountName":                 etcd.GetServiceAccountName(),
-		"disableEtcdServiceAccountAutomount": disableEtcdServiceAccountAutomount,
-		"roleName":                           fmt.Sprintf("druid.gardener.cloud:etcd:%s", etcd.Name),
-		"roleBindingName":                    fmt.Sprintf("druid.gardener.cloud:etcd:%s", etcd.Name),
-	}
-
-	return values, nil
 }
 
 func isPeerTLSChangedToEnabled(peerTLSEnabledStatusFromMembers bool, configMapValues *componentconfigmap.Values) bool {

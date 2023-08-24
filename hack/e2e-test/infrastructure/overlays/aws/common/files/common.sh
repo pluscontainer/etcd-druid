@@ -1,4 +1,5 @@
-#
+#!/usr/bin/env bash
+# 
 # Copyright (c) 2022 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+ENDPOINT_URL=""
+if [[ -n "${LOCALSTACK_HOST}" ]]; then
+  ENDPOINT_URL=" --endpoint-url=http://${LOCALSTACK_HOST}"
+fi
 
 function setup_aws() {
   if $(which aws > /dev/null); then
@@ -39,10 +45,16 @@ region = ${AWS_REGION}" > ${HOME}/.aws/config
 }
 
 function create_s3_bucket() {
-  result=$(aws s3api get-bucket-location --bucket ${TEST_ID} 2>&1 || true)
+  result=$(aws ${ENDPOINT_URL} s3api get-bucket-location --bucket ${TEST_ID} 2>&1 || true)
   if [[ $result == *NoSuchBucket* ]]; then
     echo "Creating S3 bucket ${TEST_ID} in region ${AWS_REGION}"
-    aws s3api create-bucket --bucket ${TEST_ID} --region ${AWS_REGION} --create-bucket-configuration LocationConstraint=${AWS_REGION}
+    aws ${ENDPOINT_URL} s3api create-bucket --bucket ${TEST_ID} --region ${AWS_REGION} --create-bucket-configuration LocationConstraint=${AWS_REGION} --acl private
+    # Block public access to the S3 bucket
+    aws ${ENDPOINT_URL} s3api put-public-access-block --bucket ${TEST_ID} --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+    # Deny non-HTTPS requests to the S3 bucket, except for localstack which is exposed on an HTTP endpoint
+    if [[ -z "${LOCALSTACK_HOST}" ]]; then
+      aws ${ENDPOINT_URL} s3api put-bucket-policy --bucket ${TEST_ID} --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::${TEST_ID}\",\"arn:aws:s3:::${TEST_ID}/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"},\"NumericLessThan\":{\"s3:TlsVersion\":\"1.2\"}}}]}"
+    fi
   else
     echo $result
     if [[ $result != *${AWS_REGION}* ]]; then
@@ -53,10 +65,10 @@ function create_s3_bucket() {
 
 function delete_s3_bucket() {
   echo "About to delete S3 bucket ${TEST_ID}"
-  result=$(aws s3api get-bucket-location --bucket ${TEST_ID} 2>&1 || true)
+  result=$(aws ${ENDPOINT_URL} s3api get-bucket-location --bucket ${TEST_ID} 2>&1 || true)
   if [[ $result == *NoSuchBucket* ]]; then
     echo "Bucket is already gone."
     return
   fi
-  aws s3 rb s3://${TEST_ID} --force
+  aws ${ENDPOINT_URL} s3 rb s3://${TEST_ID} --force
 }
