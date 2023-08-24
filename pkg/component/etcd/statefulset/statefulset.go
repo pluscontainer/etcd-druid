@@ -381,6 +381,68 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 			},
 		},
 	}
+
+	if sts.Name == "etcd-main" {
+		//ETCd pod
+		sts.Spec.Template.Spec.Containers[0].Lifecycle = &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"/bin/bash", "-c",
+						`echo "Taking final snapshot" && curl -k https://localhost:8080/snapshot/full && touch /tmp/etcd-dead`,
+					},
+				},
+			},
+		}
+
+		//Backup restore pod
+		sts.Spec.Template.Spec.Containers[1].Lifecycle = &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"/bin/bash", "-c",
+						"while ! [ -f /tmp/etcd-dead ]; do echo Waiting for ETCd to stop && sleep 1; done",
+					},
+				},
+			},
+		}
+	}
+
+	//Don't do this for garden cluster as there is no dedicated worker group for etcds
+	//ToDo: Please do this properly :(
+	if !strings.HasPrefix(sts.Namespace, "shoot--garden") {
+		//Only schedule on dedicated etcd worker group
+		if sts.Spec.Template.Spec.Affinity == nil {
+			sts.Spec.Template.Spec.Affinity = &corev1.Affinity{}
+		}
+
+		if sts.Spec.Template.Spec.Affinity.NodeAffinity == nil {
+			sts.Spec.Template.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "worker.gardener.cloud/pool",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"etcd-workers"},
+								},
+							},
+						},
+					},
+				},
+			}
+		}
+
+		//Add toleration for dedicated etcd worker group taint
+		sts.Spec.Template.Spec.Tolerations = append(sts.Spec.Template.Spec.Tolerations, corev1.Toleration{
+			Key:      "pske.plusserver.com/purpose",
+			Operator: corev1.TolerationOpEqual,
+			Value:    "etcd",
+			Effect:   corev1.TaintEffectNoSchedule,
+		})
+	}
+
 	if c.values.StorageClass != nil && *c.values.StorageClass != "" {
 		sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = c.values.StorageClass
 	}
@@ -500,12 +562,26 @@ func getEtcdPorts(val Values) []corev1.ContainerPort {
 var defaultResourceRequirements = corev1.ResourceRequirements{
 	Requests: corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("50m"),
-		corev1.ResourceMemory: resource.MustParse("128Mi"),
+		corev1.ResourceMemory: resource.MustParse("2Gi"),
 	},
 }
 
 func getEtcdResources(val Values) corev1.ResourceRequirements {
 	if val.EtcdResourceRequirements != nil {
+
+		if val.Name == "etcd-main" {
+			//In-Memory fix -> Check if memory size is too small and bump it
+			req := *val.EtcdResourceRequirements
+			newReq := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    *req.Limits.Cpu(),
+					corev1.ResourceMemory: resource.MustParse("2Gi"),
+				},
+			}
+
+			return newReq
+		}
+
 		return *val.EtcdResourceRequirements
 	}
 
@@ -527,9 +603,16 @@ func getEtcdEnvVars(val Values) []corev1.EnvVar {
 }
 
 func getEtcdVolumeMounts(val Values) []corev1.VolumeMount {
+	volumeMountName := val.VolumeClaimTemplateName
+
+	//If its the main-etcd -> Gardener & fork custom fix
+	if val.Name == "etcd-main" {
+		volumeMountName = "etcd-in-memory"
+	}
+
 	vms := []corev1.VolumeMount{
 		{
-			Name:      val.VolumeClaimTemplateName,
+			Name:      volumeMountName,
 			MountPath: "/var/etcd/data/",
 		},
 	}
@@ -569,9 +652,16 @@ func getSecretVolumeMounts(clientUrlTLS, peerUrlTLS *druidv1alpha1.TLSConfig) []
 }
 
 func getBackupRestoreVolumeMounts(val Values) []corev1.VolumeMount {
+	volumeMountName := val.VolumeClaimTemplateName
+
+	//If its the main-etcd -> Gardener & fork custom fix
+	if val.Name == "etcd-main" {
+		volumeMountName = "etcd-in-memory"
+	}
+
 	vms := []corev1.VolumeMount{
 		{
-			Name:      val.VolumeClaimTemplateName,
+			Name:      volumeMountName,
 			MountPath: "/var/etcd/data",
 		},
 		{
@@ -663,6 +753,18 @@ func getVolumes(ctx context.Context, cl client.Client, logger logr.Logger, val V
 				},
 			},
 		},
+	}
+
+	if val.Name == "etcd-main" {
+		vs = append(vs, corev1.Volume{
+			Name: "etcd-in-memory",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium:    corev1.StorageMediumMemory,
+					SizeLimit: val.Quota,
+				},
+			},
+		})
 	}
 
 	if val.ClientUrlTLS != nil {

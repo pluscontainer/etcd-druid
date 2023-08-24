@@ -37,7 +37,7 @@ source "${SOURCE_PATH}/.ci/common.sh"
 
 ###############################################################################
 
-CGO_ENABLED=0 GO111MODULE=on go build \
+CGO_ENABLED=0 GO111MODULE=on GOARCH=amd64 GOOS=linux go build \
   -mod vendor \
   -v \
   -o "${BINARY_PATH}"/etcd-druid \

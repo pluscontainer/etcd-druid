@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+        # Change the value of image field below to your controller image URL
+        - image: node-647ee1368442ecd1a315c673.ps-xaas.io/gardener/etcd-druid:v0.17.0-in-memory-dev-0.0.11
+          name: druid

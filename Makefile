@@ -15,7 +15,7 @@
 # Image URL to use all building/pushing image targets
 VERSION             := $(shell cat VERSION)
 REPO_ROOT           := $(shell dirname "$(realpath $(lastword $(MAKEFILE_LIST)))")
-REGISTRY            := eu.gcr.io/gardener-project/gardener
+REGISTRY            := node-647ee1368442ecd1a315c673.ps-xaas.io/gardener
 IMAGE_REPOSITORY    := $(REGISTRY)/etcd-druid
 IMAGE_BUILD_TAG     := $(VERSION)
 BUILD_DIR           := build
