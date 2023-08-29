@@ -676,20 +676,19 @@ func getEtcdPorts(val Values) []corev1.ContainerPort {
 var defaultResourceRequirements = corev1.ResourceRequirements{
 	Requests: corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("50m"),
-		corev1.ResourceMemory: resource.MustParse("2Gi"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
 	},
 }
 
 func getEtcdResources(val Values) corev1.ResourceRequirements {
 	if val.EtcdResourceRequirements != nil {
-
 		if val.Name == "etcd-main" {
 			//In-Memory fix -> Check if memory size is too small and bump it
 			req := *val.EtcdResourceRequirements
 			newReq := corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    *req.Limits.Cpu(),
-					corev1.ResourceMemory: resource.MustParse("2Gi"),
+					corev1.ResourceMemory: resource.MustParse("3Gi"),
 				},
 			}
 
