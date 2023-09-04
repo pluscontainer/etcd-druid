@@ -1,17 +1,14 @@
+nodesSelector:
+  path: /docs
 structure:
 - name: _index.md
+  properties:
+    frontmatter:
+      title: etcd Druid
+      description: A druid for etcd management in Gardener
   source: /README.md
-- name: etcd-druid-api
-  nodes:
-  - name: _index.md
-    properties:
-      frontmatter:
-        title: API Reference
-        weight: 1
-        aliases: "/api-reference"
-        categories:
-          - Developers
-    source: https://github.com/gardener/etcd-druid-api/blob/DEFAULT_BRANCH/README.md
-  - name: api-reference
-    nodesSelector:
-      path: https://github.com/gardener/etcd-druid-api/tree/DEFAULT_BRANCH/docs/api-reference
+- name: api-reference
+  properties:
+    frontmatter:
+      title: API Reference
+  source: https://github.com/gardener/etcd-druid-api/blob/DEFAULT_BRANCH/docs/api-reference/druid.md

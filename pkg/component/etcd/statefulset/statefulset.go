@@ -24,8 +24,8 @@ import (
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	"github.com/gardener/etcd-druid/pkg/common"
 	"github.com/gardener/etcd-druid/pkg/utils"
+	gardenercomponent "github.com/gardener/gardener/pkg/component"
 	"github.com/gardener/gardener/pkg/controllerutils"
-	gardenercomponent "github.com/gardener/gardener/pkg/operation/botanist/component"
 	"github.com/gardener/gardener/pkg/utils/flow"
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	"github.com/gardener/gardener/pkg/utils/retry"
@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -49,29 +50,28 @@ type Interface interface {
 }
 
 type component struct {
-	client client.Client
-	logger logr.Logger
-	values Values
+	client       client.Client
+	logger       logr.Logger
+	values       Values
+	featureGates map[featuregate.Feature]bool
 }
 
 // New creates a new StatefulSet deployer instance.
-func New(c client.Client, logger logr.Logger, values Values) Interface {
+func New(c client.Client, logger logr.Logger, values Values, featureGates map[featuregate.Feature]bool) Interface {
 	objectLogger := logger.WithValues("sts", client.ObjectKey{Name: values.Name, Namespace: values.Namespace})
 
 	return &component{
-		client: c,
-		logger: objectLogger,
-		values: values,
+		client:       c,
+		logger:       objectLogger,
+		values:       values,
+		featureGates: featureGates,
 	}
 }
 
 // Destroy deletes the StatefulSet
 func (c *component) Destroy(ctx context.Context) error {
 	sts := c.emptyStatefulset()
-	if err := client.IgnoreNotFound(c.client.Delete(ctx, sts)); err != nil {
-		return err
-	}
-	return nil
+	return client.IgnoreNotFound(c.client.Delete(ctx, sts))
 }
 
 // Deploy executes a deploy-flow to ensure that the StatefulSet is synchronized correctly
@@ -107,9 +107,10 @@ func (c *component) Wait(ctx context.Context) error {
 		if getErr := c.client.Get(ctx, client.ObjectKeyFromObject(sts), sts); getErr != nil {
 			return err
 		}
-		messages, err2 := c.fetchPVCEventsFor(ctx, sts)
+		messages, errorPVC, err2 := c.fetchPVCEventsForStatefulset(ctx, sts)
 		if err2 != nil {
-			c.logger.Error(err2, "Error while fetching events for depending PVC")
+			c.logger.Error(err2, "Error while fetching events for depending PVCs for statefulset",
+				"namespace", sts.Namespace, "statefulsetName", sts.Name, "pvcName", *errorPVC)
 			// don't expose this error since fetching events is the best effort
 			// and shouldn't be confused with the actual error
 			return err
@@ -136,7 +137,7 @@ func (c *component) getLatestPodCreationTime(ctx context.Context, sts *appsv1.St
 	return recentCreationTime, nil
 }
 
-func (c *component) waitUtilPodsReady(ctx context.Context, originalSts *appsv1.StatefulSet, podDeletionTime time.Time, interval time.Duration, timeout time.Duration) error {
+func (c *component) waitUntilPodsReady(ctx context.Context, originalSts *appsv1.StatefulSet, podDeletionTime time.Time, interval time.Duration, timeout time.Duration) error {
 	sts := appsv1.StatefulSet{}
 	return gardenerretry.UntilTimeout(ctx, interval, timeout, func(ctx context.Context) (bool, error) {
 		if err := c.client.Get(ctx, client.ObjectKeyFromObject(originalSts), &sts); err != nil {
@@ -146,14 +147,14 @@ func (c *component) waitUtilPodsReady(ctx context.Context, originalSts *appsv1.S
 			return gardenerretry.SevereError(err)
 		}
 		if sts.Status.ReadyReplicas < *sts.Spec.Replicas {
-			return gardenerretry.MinorError(fmt.Errorf(fmt.Sprintf("Only %d out of %d replicas are ready", sts.Status.ReadyReplicas, sts.Spec.Replicas)))
+			return gardenerretry.MinorError(fmt.Errorf("only %d out of %d replicas are ready", sts.Status.ReadyReplicas, sts.Spec.Replicas))
 		}
 		recentPodCreationTime, err := c.getLatestPodCreationTime(ctx, &sts)
 		if err != nil {
 			return gardenerretry.MinorError(fmt.Errorf("failed to get most recent pod creation timestamp: %w", err))
 		}
 		if recentPodCreationTime.Before(podDeletionTime) {
-			return gardenerretry.MinorError(fmt.Errorf(fmt.Sprintf("Most recent pod creation time %v is still before the %v time when the pods were deleted.", recentPodCreationTime, podDeletionTime)))
+			return gardenerretry.MinorError(fmt.Errorf("most recent pod creation time %v is still before the %v time when the pods were deleted", recentPodCreationTime, podDeletionTime))
 		}
 		return gardenerretry.Ok()
 	})
@@ -169,7 +170,7 @@ func (c *component) waitDeploy(ctx context.Context, originalSts *appsv1.Stateful
 			return gardenerretry.SevereError(err)
 		}
 		if updatedSts.Generation < originalSts.Generation {
-			return gardenerretry.MinorError(fmt.Errorf("StatulfulSet generation has not yet been updated in the cache"))
+			return gardenerretry.MinorError(fmt.Errorf("statefulset generation has not yet been updated in the cache"))
 		}
 		if ready, reason := utils.IsStatefulSetReady(replicas, &updatedSts); !ready {
 			return gardenerretry.MinorError(fmt.Errorf(reason))
@@ -205,7 +206,7 @@ func (c *component) createDeployFlow(ctx context.Context) (*flow.Flow, error) {
 		return nil, err
 	}
 
-	flowName := fmt.Sprintf("(etcd: %s) Deploy Flow for StatefulSet %s for Namespace: %s", c.values.EtcdUID, c.values.Name, c.values.Namespace)
+	flowName := fmt.Sprintf("(etcd: %s) Deploy Flow for StatefulSet %s for Namespace: %s", getOwnerReferenceNameWithUID(c.values.OwnerReference), c.values.Name, c.values.Namespace)
 	g := flow.NewGraph(flowName)
 
 	var taskID *flow.TaskID
@@ -253,7 +254,7 @@ func (c *component) addTasksForPeerUrlTLSChangedToEnabled(g *flow.Graph, sts *ap
 		waitLeaseUpdateID := g.Add(flow.Task{
 			Name: waitForLeaseUpdateOpName,
 			Fn: func(ctx context.Context) error {
-				return c.waitUntilTLSEnabled(ctx, waitForLeaseUpdateOpName, 3*time.Minute)
+				return c.waitUntilTLSEnabled(ctx, 3*time.Minute)
 			},
 			Dependencies: flow.NewTaskIDs(updateTaskID),
 		})
@@ -283,7 +284,7 @@ func (c *component) addImmutableFieldUpdateTask(g *flow.Graph, sts *appsv1.State
 			Fn:           func(ctx context.Context) error { return c.destroyAndWait(ctx, opName) },
 			Dependencies: nil,
 		})
-		c.logger.Info("added delete StatefulSet task to deploy flow due to immutable field update task", "namespace", c.values.Namespace, "name", c.values.Name, "etcdUID", c.values.EtcdUID)
+		c.logger.Info("added delete StatefulSet task to deploy flow due to immutable field update task", "namespace", c.values.Namespace, "name", c.values.Name, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference))
 		return &taskID
 	}
 	return nil
@@ -300,7 +301,7 @@ func (c *component) addCreateOrPatchTask(g *flow.Graph, originalSts *appsv1.Stat
 	taskID := g.Add(flow.Task{
 		Name: "sync StatefulSet task",
 		Fn: func(ctx context.Context) error {
-			c.logger.Info("createOrPatch sts", "replicas", c.values.Replicas)
+			c.logger.Info("createOrPatch sts", "namespace", c.values.Namespace, "name", c.values.Name, "replicas", c.values.Replicas)
 			var (
 				sts = originalSts
 				err error
@@ -318,7 +319,7 @@ func (c *component) addCreateOrPatchTask(g *flow.Graph, originalSts *appsv1.Stat
 		},
 		Dependencies: dependencies,
 	})
-	c.logger.Info("added createOrPatch StatefulSet task to the deploy flow", "taskID", taskID, "namespace", c.values.Namespace, "etcdUID", c.values.EtcdUID, "StatefulSetName", c.values.Name, "replicas", c.values.Replicas)
+	c.logger.Info("added createOrPatch StatefulSet task to the deploy flow", "taskID", taskID, "namespace", c.values.Namespace, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference), "StatefulSetName", c.values.Name, "replicas", c.values.Replicas)
 }
 
 func (c *component) getExistingSts(ctx context.Context) (*appsv1.StatefulSet, error) {
@@ -333,11 +334,11 @@ func (c *component) getExistingSts(ctx context.Context) (*appsv1.StatefulSet, er
 }
 
 func (c *component) updateAndWait(ctx context.Context, opName string, sts *appsv1.StatefulSet, replicas int32) error {
-	c.logger.Info("Updating StatefulSet spec with Peer URL TLS mount", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", c.values.EtcdUID, "replicas", replicas)
+	c.logger.Info("Updating StatefulSet spec with Peer URL TLS mount", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference), "replicas", replicas)
 	return c.doCreateOrUpdate(ctx, opName, sts, replicas, true)
 }
 
-func (c *component) waitUntilTLSEnabled(ctx context.Context, opName string, timeout time.Duration) error {
+func (c *component) waitUntilTLSEnabled(ctx context.Context, timeout time.Duration) error {
 	return gardenerretry.UntilTimeout(ctx, defaultInterval, timeout, func(ctx context.Context) (bool, error) {
 		tlsEnabled, err := utils.IsPeerURLTLSEnabled(ctx, c.client, c.values.Namespace, c.values.Name, c.logger)
 		if err != nil {
@@ -352,7 +353,7 @@ func (c *component) waitUntilTLSEnabled(ctx context.Context, opName string, time
 
 func (c *component) deleteAllStsPods(ctx context.Context, opName string, sts *appsv1.StatefulSet) error {
 	replicas := sts.Spec.Replicas
-	c.logger.Info("Deleting all StatefulSet pods", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", c.values.EtcdUID, "replicas", replicas, "matching labels", sts.Spec.Template.Labels)
+	c.logger.Info("Deleting all StatefulSet pods", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference), "replicas", replicas, "matching labels", sts.Spec.Template.Labels)
 	timeBeforeDeletion := time.Now()
 
 	if err := c.client.DeleteAllOf(ctx, &corev1.Pod{}, client.InNamespace(sts.Namespace), client.MatchingLabels(sts.Spec.Template.Labels)); err != nil {
@@ -362,8 +363,8 @@ func (c *component) deleteAllStsPods(ctx context.Context, opName string, sts *ap
 	const timeout = 3 * time.Minute
 	const interval = 2 * time.Second
 
-	c.logger.Info("waiting for StatefulSet pods to start again after delete", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", c.values.EtcdUID, "replicas", replicas)
-	return c.waitUtilPodsReady(ctx, sts, timeBeforeDeletion, interval, timeout)
+	c.logger.Info("waiting for StatefulSet pods to start again after delete", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference), "replicas", replicas)
+	return c.waitUntilPodsReady(ctx, sts, timeBeforeDeletion, interval, timeout)
 }
 
 func (c *component) doCreateOrUpdate(ctx context.Context, opName string, sts *appsv1.StatefulSet, replicas int32, preserveObjectMetadata bool) error {
@@ -376,11 +377,8 @@ func (c *component) doCreateOrUpdate(ctx context.Context, opName string, sts *ap
 
 func (c *component) destroyAndWait(ctx context.Context, opName string) error {
 	deleteAndWait := gardenercomponent.OpDestroyAndWait(c)
-	c.logger.Info("deleting sts", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", c.values.EtcdUID)
-	if err := deleteAndWait.Destroy(ctx); err != nil {
-		return err
-	}
-	return nil
+	c.logger.Info("deleting sts", "namespace", c.values.Namespace, "name", c.values.Name, "operation", opName, "etcdUID", getOwnerReferenceNameWithUID(c.values.OwnerReference))
+	return deleteAndWait.Destroy(ctx)
 }
 
 func immutableFieldUpdate(sts *appsv1.StatefulSet, val Values) bool {
@@ -390,7 +388,8 @@ func immutableFieldUpdate(sts *appsv1.StatefulSet, val Values) bool {
 func clusterScaledUpToMultiNode(val *Values, sts *appsv1.StatefulSet) bool {
 	if sts != nil && sts.Spec.Replicas != nil {
 		return (val.Replicas > 1 && *sts.Spec.Replicas == 1 && sts.Status.AvailableReplicas == 1) ||
-			(metav1.HasAnnotation(sts.ObjectMeta, scaleToMultiNodeAnnotationKey) && sts.Status.UpdatedReplicas < *sts.Spec.Replicas)
+			(metav1.HasAnnotation(sts.ObjectMeta, scaleToMultiNodeAnnotationKey) &&
+				(sts.Status.UpdatedReplicas < *sts.Spec.Replicas || sts.Status.AvailableReplicas < sts.Status.UpdatedReplicas))
 	}
 	return val.Replicas > 1 && val.StatusReplicas == 1
 }
@@ -403,7 +402,6 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 		if err != nil {
 			return err
 		}
-
 		sts.ObjectMeta = getObjectMeta(&c.values, sts, preserveAnnotations)
 		sts.Spec = appsv1.StatefulSetSpec{
 			PodManagementPolicy: appsv1.ParallelPodManagement,
@@ -413,12 +411,12 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 			Replicas:    &replicas,
 			ServiceName: c.values.PeerServiceName,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: getCommonLabels(&c.values),
+				MatchLabels: c.values.Labels,
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: c.values.Annotations,
-					Labels:      sts.GetLabels(),
+					Labels:      utils.MergeStringMaps(make(map[string]string), c.values.AdditionalPodLabels, c.values.Labels),
 				},
 				Spec: corev1.PodSpec{
 					HostAliases: []corev1.HostAlias{
@@ -435,7 +433,7 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 							Name:            "etcd",
 							Image:           c.values.EtcdImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command:         c.values.EtcdCommand,
+							Args:            c.values.EtcdCommand,
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler:        getReadinessHandler(c.values),
 								InitialDelaySeconds: 15,
@@ -451,11 +449,11 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 							Name:            "backup-restore",
 							Image:           c.values.BackupImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command:         c.values.EtcdBackupCommand,
+							Args:            c.values.EtcdBackupCommand,
 							Ports:           getBackupPorts(c.values),
 							Resources:       getBackupResources(c.values),
 							Env:             getBackupRestoreEnvVars(c.values),
-							VolumeMounts:    getBackupRestoreVolumeMounts(c.values),
+							VolumeMounts:    getBackupRestoreVolumeMounts(c),
 							SecurityContext: &corev1.SecurityContext{
 								Capabilities: &corev1.Capabilities{
 									Add: []corev1.Capability{
@@ -551,6 +549,48 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 		if c.values.PriorityClassName != nil {
 			sts.Spec.Template.Spec.PriorityClassName = *c.values.PriorityClassName
 		}
+		if c.values.UseEtcdWrapper {
+			// sections to add only when using etcd wrapper
+			// TODO: @aaronfern add this back to sts.Spec when UseEtcdWrapper becomes GA
+			sts.Spec.Template.Spec.InitContainers = []corev1.Container{
+				{
+					Name:         "change-permissions",
+					Image:        "alpine:3.18.2",
+					Command:      []string{"sh", "-c", "--"},
+					Args:         []string{"chown -R 65532:65532 /var/etcd/data"},
+					VolumeMounts: getEtcdVolumeMounts(c.values),
+					SecurityContext: &corev1.SecurityContext{
+						RunAsGroup:   pointer.Int64(0),
+						RunAsNonRoot: pointer.Bool(false),
+						RunAsUser:    pointer.Int64(0),
+					},
+				},
+			}
+			if c.values.BackupStore != nil {
+				// Special container to change permissions of backup bucket folder to 65532 (nonroot)
+				// Only used with local provider
+				prov, _ := utils.StorageProviderFromInfraProvider(c.values.BackupStore.Provider)
+				if prov == utils.Local {
+					sts.Spec.Template.Spec.InitContainers = append(sts.Spec.Template.Spec.InitContainers, corev1.Container{
+						Name:         "change-backup-bucket-permissions",
+						Image:        "alpine:3.18.2",
+						Command:      []string{"sh", "-c", "--"},
+						Args:         []string{fmt.Sprintf("chown -R 65532:65532 /home/nonroot/%s", *c.values.BackupStore.Container)},
+						VolumeMounts: getBackupRestoreVolumeMounts(c),
+						SecurityContext: &corev1.SecurityContext{
+							RunAsGroup:   pointer.Int64(0),
+							RunAsNonRoot: pointer.Bool(false),
+							RunAsUser:    pointer.Int64(0),
+						},
+					})
+				}
+			}
+			sts.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+				RunAsGroup:   pointer.Int64(65532),
+				RunAsNonRoot: pointer.Bool(true),
+				RunAsUser:    pointer.Int64(65532),
+			}
+		}
 
 		if stsOriginal.Generation > 0 {
 			// Keep immutable fields
@@ -564,14 +604,16 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 	if err != nil {
 		return err
 	}
-	c.logger.Info("createOrPatch is completed", "Namespace", sts.Namespace, "Name", sts.Name, "operation-result", operationResult)
+	c.logger.Info("createOrPatch is completed", "namespace", sts.Namespace, "name", sts.Name, "operation-result", operationResult)
 	return nil
 }
 
-func (c *component) fetchPVCEventsFor(ctx context.Context, ss *appsv1.StatefulSet) (string, error) {
+// fetchPVCEventsForStatefulset fetches events for PVCs for a statefulset and return the events,
+// as well as possible error and name of the PVC that caused the error
+func (c *component) fetchPVCEventsForStatefulset(ctx context.Context, ss *appsv1.StatefulSet) (string, *string, error) {
 	pvcs := &corev1.PersistentVolumeClaimList{}
 	if err := c.client.List(ctx, pvcs, client.InNamespace(ss.GetNamespace())); err != nil {
-		return "", err
+		return "", pointer.String(""), err
 	}
 
 	var (
@@ -585,14 +627,14 @@ func (c *component) fetchPVCEventsFor(ctx context.Context, ss *appsv1.StatefulSe
 			}
 			messages, err := kutil.FetchEventMessages(ctx, c.client.Scheme(), c.client, &pvc, corev1.EventTypeWarning, 2)
 			if err != nil {
-				return "", err
+				return "", &pvc.Name, err
 			}
 			if messages != "" {
 				pvcMessages += fmt.Sprintf("Warning for PVC %s:\n%s\n", pvc.Name, messages)
 			}
 		}
 	}
-	return pvcMessages, nil
+	return pvcMessages, nil, nil
 }
 
 func (c *component) emptyStatefulset() *appsv1.StatefulSet {
@@ -604,38 +646,18 @@ func (c *component) emptyStatefulset() *appsv1.StatefulSet {
 	}
 }
 
-func getCommonLabels(val *Values) map[string]string {
-	return map[string]string{
-		"name":     "etcd",
-		"instance": val.Name,
-	}
-}
-
 func getObjectMeta(val *Values, sts *appsv1.StatefulSet, preserveAnnotations bool) metav1.ObjectMeta {
-	var annotations map[string]string
-	labels := utils.MergeStringMaps(getCommonLabels(val), val.Labels)
-	if preserveAnnotations {
-		annotations = sts.Annotations
-	} else {
+	annotations := sts.Annotations
+	if !preserveAnnotations {
 		annotations = getStsAnnotations(val, sts)
-	}
-	ownerRefs := []metav1.OwnerReference{
-		{
-			APIVersion:         druidv1alpha1.GroupVersion.String(),
-			Kind:               "Etcd",
-			Name:               val.Name,
-			UID:                val.EtcdUID,
-			Controller:         pointer.Bool(true),
-			BlockOwnerDeletion: pointer.Bool(true),
-		},
 	}
 
 	return metav1.ObjectMeta{
 		Name:            val.Name,
 		Namespace:       val.Namespace,
-		Labels:          labels,
+		Labels:          val.Labels,
 		Annotations:     annotations,
-		OwnerReferences: ownerRefs,
+		OwnerReferences: []metav1.OwnerReference{val.OwnerReference},
 	}
 }
 
@@ -764,11 +786,11 @@ func getSecretVolumeMounts(clientUrlTLS, peerUrlTLS *druidv1alpha1.TLSConfig) []
 	return vms
 }
 
-func getBackupRestoreVolumeMounts(val Values) []corev1.VolumeMount {
-	volumeMountName := val.VolumeClaimTemplateName
+func getBackupRestoreVolumeMounts(c *component) []corev1.VolumeMount {
+	volumeMountName := c.values.VolumeClaimTemplateName
 
 	//If its the main-etcd -> Gardener & fork custom fix
-	if val.Name == "etcd-main" {
+	if c.values.Name == "etcd-main" {
 		volumeMountName = "etcd-in-memory"
 	}
 
@@ -783,34 +805,41 @@ func getBackupRestoreVolumeMounts(val Values) []corev1.VolumeMount {
 		},
 	}
 
-	vms = append(vms, getSecretVolumeMounts(val.ClientUrlTLS, val.PeerUrlTLS)...)
+	vms = append(vms, getSecretVolumeMounts(c.values.ClientUrlTLS, c.values.PeerUrlTLS)...)
 
-	if val.BackupStore == nil {
+	if c.values.BackupStore == nil {
 		return vms
 	}
 
-	provider, err := utils.StorageProviderFromInfraProvider(val.BackupStore.Provider)
+	provider, err := utils.StorageProviderFromInfraProvider(c.values.BackupStore.Provider)
 	if err != nil {
 		return vms
 	}
 
 	switch provider {
 	case utils.Local:
-		if val.BackupStore.Container != nil {
-			vms = append(vms, corev1.VolumeMount{
-				Name:      "host-storage",
-				MountPath: pointer.StringDeref(val.BackupStore.Container, ""),
-			})
+		if c.values.BackupStore.Container != nil {
+			if c.featureGates["UseEtcdWrapper"] {
+				vms = append(vms, corev1.VolumeMount{
+					Name:      "host-storage",
+					MountPath: "/home/nonroot/" + pointer.StringDeref(c.values.BackupStore.Container, ""),
+				})
+			} else {
+				vms = append(vms, corev1.VolumeMount{
+					Name:      "host-storage",
+					MountPath: pointer.StringDeref(c.values.BackupStore.Container, ""),
+				})
+			}
 		}
 	case utils.GCS:
 		vms = append(vms, corev1.VolumeMount{
 			Name:      "etcd-backup",
-			MountPath: "/root/.gcp/",
+			MountPath: "/var/.gcp/",
 		})
 	case utils.S3, utils.ABS, utils.OSS, utils.Swift, utils.OCS:
 		vms = append(vms, corev1.VolumeMount{
 			Name:      "etcd-backup",
-			MountPath: "/root/etcd-backup/",
+			MountPath: "/var/etcd-backup/",
 		})
 	}
 
@@ -997,7 +1026,7 @@ func getBackupRestoreEnvVars(val Values) []corev1.EnvVar {
 	}
 
 	// TODO(timuthy): move this to a non root path when we switch to a rootless distribution
-	const credentialsMountPath = "/root/etcd-backup"
+	const credentialsMountPath = "/var/etcd-backup"
 	switch provider {
 	case utils.S3:
 		env = append(env, getEnvVarFromValue("AWS_APPLICATION_CREDENTIALS", credentialsMountPath))
@@ -1006,7 +1035,7 @@ func getBackupRestoreEnvVars(val Values) []corev1.EnvVar {
 		env = append(env, getEnvVarFromValue("AZURE_APPLICATION_CREDENTIALS", credentialsMountPath))
 
 	case utils.GCS:
-		env = append(env, getEnvVarFromValue("GOOGLE_APPLICATION_CREDENTIALS", "/root/.gcp/serviceaccount.json"))
+		env = append(env, getEnvVarFromValue("GOOGLE_APPLICATION_CREDENTIALS", "/var/.gcp/serviceaccount.json"))
 
 	case utils.Swift:
 		env = append(env, getEnvVarFromValue("OPENSTACK_APPLICATION_CREDENTIALS", credentialsMountPath))
@@ -1083,9 +1112,29 @@ func getReadinessHandlerForSingleNode(val Values) corev1.ProbeHandler {
 }
 
 func getReadinessHandlerForMultiNode(val Values) corev1.ProbeHandler {
+	if val.UseEtcdWrapper {
+		//TODO @aaronfern: remove this feature gate when UseEtcdWrapper becomes GA
+		scheme := corev1.URISchemeHTTPS
+		if val.BackupTLS == nil {
+			scheme = corev1.URISchemeHTTP
+		}
+
+		return corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path:   "/readyz",
+				Port:   intstr.FromInt(int(pointer.Int32Deref(val.WrapperPort, defaultWrapperPort))),
+				Scheme: scheme,
+			},
+		}
+	}
+
 	return corev1.ProbeHandler{
 		Exec: &corev1.ExecAction{
 			Command: val.ReadinessProbeCommand,
 		},
 	}
+}
+
+func getOwnerReferenceNameWithUID(ref metav1.OwnerReference) string {
+	return fmt.Sprintf("%s:%s", ref.Name, ref.UID)
 }

@@ -73,9 +73,15 @@ install: manifests
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 .PHONY: deploy
-deploy: manifests $(KUSTOMIZE)
+deploy-via-kustomize: manifests $(KUSTOMIZE)
 	kubectl apply -f config/crd/bases
 	kustomize build config/default | kubectl apply -f -
+
+# Deploy controller to the Kubernetes cluster specified in the environment variable KUBECONFIG
+# Modify the Helm template located at charts/druid/templates if any changes are required
+.PHONY: deploy
+deploy: $(SKAFFOLD) 
+	$(SKAFFOLD) run -m etcd-druid
 
 # Generate manifests e.g. CRD, RBAC etc.
 .PHONY: manifests
@@ -95,7 +101,7 @@ clean: set-permissions
 
 # Check packages
 .PHONY: check
-check: $(GOLANGCI_LINT) $(GOIMPORTS) set-permissions
+check: $(GOLANGCI_LINT) $(GOIMPORTS) set-permissions fmt manifests
 	@"$(REPO_ROOT)/vendor/github.com/gardener/gardener/hack/check.sh" --golangci-lint-config=./.golangci.yaml ./api/... ./pkg/... ./controllers/...
 
 .PHONY: check-generate
@@ -104,7 +110,7 @@ check-generate: set-permissions
 
 # Generate code
 .PHONY: generate
-generate: set-permissions $(CONTROLLER_GEN) $(GOIMPORTS) $(MOCKGEN)
+generate: set-permissions manifests $(CONTROLLER_GEN) $(GOIMPORTS) $(MOCKGEN)
 	@go generate "$(REPO_ROOT)/pkg/..."
 	@"$(REPO_ROOT)/hack/update-codegen.sh"
 
@@ -122,7 +128,7 @@ docker-push:
 
 # Run tests
 .PHONY: test
-test: set-permissions $(GINKGO) $(SETUP_ENVTEST) fmt check manifests
+test: set-permissions $(GINKGO) $(SETUP_ENVTEST)
 	@"$(REPO_ROOT)/hack/test.sh" ./api/... ./controllers/... ./pkg/...
 
 .PHONY: test-cov
@@ -138,7 +144,7 @@ test-e2e: set-permissions $(KUBECTL) $(HELM) $(SKAFFOLD)
 	@"$(REPO_ROOT)/hack/e2e-test/run-e2e-test.sh" $(PROVIDERS)
 
 .PHONY: test-integration
-test-integration: set-permissions $(GINKGO) $(SETUP_ENVTEST) fmt check manifests
+test-integration: set-permissions $(GINKGO) $(SETUP_ENVTEST)
 	@"$(REPO_ROOT)/hack/test.sh" ./test/integration/...
 
 .PHONY: update-dependencies

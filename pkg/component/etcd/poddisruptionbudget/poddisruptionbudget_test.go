@@ -28,9 +28,8 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 
-	"github.com/gardener/gardener/pkg/operation/botanist/component"
+	"github.com/gardener/gardener/pkg/component"
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
@@ -152,46 +151,42 @@ var _ = Describe("PodDisruptionBudget", func() {
 					pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_20_0)
 					Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
-					Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 					Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", 0))
-					checkV1beta1PDB(pdb, &values)
+					checkV1beta1PDB(pdb, &values, namespace)
 				})
 			})
-			Context("when etcd replicas are 5 and clusterSize in etcd status is 5", func() {
+			Context("when etcd replicas are 5", func() {
 				It("should create the PDB successfully", func() {
 					etcd.Spec.Replicas = 5
-					etcd.Status = druidv1alpha1.EtcdStatus{
-						ClusterSize: pointer.Int32(4),
-					}
 					values = GenerateValues(etcd)
 					pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_20_0)
 					Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
-					Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 					Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", 3))
-					checkV1beta1PDB(pdb, &values)
+					checkV1beta1PDB(pdb, &values, namespace)
 				})
 			})
 		})
 
 		Context("when pdb already exists", func() {
-			It("should update the pdb successfully", func() {
+			It("should update the pdb successfully when etcd replicas change", func() {
+				// existing PDB with min = 0
 				values = GenerateValues(etcd)
 				Expect(cl.Create(ctx, defaultPDB)).To(Succeed())
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", 0))
 
+				// Post updating the etcd replicas
 				etcd.Spec.Replicas = 5
-				etcd.Status = druidv1alpha1.EtcdStatus{
-					ClusterSize: pointer.Int32(4),
-				}
 				values = GenerateValues(etcd)
 				pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_20_0)
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", 3))
-				checkV1beta1PDB(pdb, &values)
+				checkV1beta1PDB(pdb, &values, namespace)
 			})
 		})
 	})
@@ -206,10 +201,10 @@ var _ = Describe("PodDisruptionBudget", func() {
 			values = GenerateValues(etcd)
 		})
 		Context("when PDB does not exist", func() {
-			It("should destroy successfully", func() {
+			It("should destroy successfully ignoring the not-found error", func() {
 				pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_20_0)
 				Expect(pdbDeployer.Destroy(ctx)).To(Succeed())
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(BeNotFoundError())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(BeNotFoundError())
 			})
 		})
 
@@ -218,7 +213,7 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(cl.Create(ctx, defaultPDB)).To(Succeed())
 				pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_20_0)
 				Expect(pdbDeployer.Destroy(ctx)).To(Succeed())
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(BeNotFoundError())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(BeNotFoundError())
 			})
 		})
 	})
@@ -233,9 +228,6 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(pdb.APIVersion).To(Equal("policy/v1beta1"))
 
 				etcd.Spec.Replicas = 5
-				etcd.Status = druidv1alpha1.EtcdStatus{
-					ClusterSize: pointer.Int32(4),
-				}
 				values = GenerateValues(etcd)
 				pdbDeployer = New(cl, namespace, &values, *k8sVersion_1_25_0)
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
@@ -244,11 +236,10 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(cl.Get(ctx, kutil.Key(namespace, name), pdb1)).To(Succeed())
 				Expect(pdb1.APIVersion).To(Equal("policy/v1"))
 				Expect(pdb1.Spec.MinAvailable.IntVal).To(BeNumerically("==", 3))
-				checkV1PDB(pdb1, &values)
+				checkV1PDB(pdb1, &values, namespace)
 
 				Expect(cl.Delete(ctx, pdb1)).To(Succeed())
 				Expect(cl.Delete(ctx, pdb)).To(Succeed())
-
 			})
 		})
 	})
@@ -261,9 +252,9 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
 				pdb := &policyv1beta1.PodDisruptionBudget{}
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.APIVersion).To(Equal("policy/v1beta1"))
-				checkV1beta1PDB(pdb, &values)
+				checkV1beta1PDB(pdb, &values, namespace)
 
 				Expect(cl.Delete(ctx, pdb)).To(Succeed())
 			})
@@ -275,9 +266,9 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
 				pdb := &policyv1.PodDisruptionBudget{}
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.APIVersion).To(Equal("policy/v1"))
-				checkV1PDB(pdb, &values)
+				checkV1PDB(pdb, &values, namespace)
 
 				Expect(cl.Delete(ctx, pdb)).To(Succeed())
 			})
@@ -291,9 +282,9 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
 				pdb := &policyv1beta1.PodDisruptionBudget{}
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.APIVersion).To(Equal("policy/v1beta1"))
-				checkV1beta1PDB(pdb, &values)
+				checkV1beta1PDB(pdb, &values, namespace)
 
 				Expect(cl.Delete(ctx, pdb)).To(Succeed())
 			})
@@ -305,9 +296,9 @@ var _ = Describe("PodDisruptionBudget", func() {
 				Expect(pdbDeployer.Deploy(ctx)).To(Succeed())
 
 				pdb := &policyv1.PodDisruptionBudget{}
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.EtcdName), pdb)).To(Succeed())
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), pdb)).To(Succeed())
 				Expect(pdb.APIVersion).To(Equal("policy/v1"))
-				checkV1PDB(pdb, &values)
+				checkV1PDB(pdb, &values, namespace)
 
 				Expect(cl.Delete(ctx, pdb)).To(Succeed())
 			})
@@ -315,52 +306,36 @@ var _ = Describe("PodDisruptionBudget", func() {
 	})
 })
 
-func checkV1beta1PDB(pdb *policyv1beta1.PodDisruptionBudget, values *Values) {
-	checkPDBMetadata(&pdb.ObjectMeta, values)
-
+func checkV1beta1PDB(pdb *policyv1beta1.PodDisruptionBudget, values *Values, expectedNamespace string) {
+	Expect(pdb.Name).To(Equal(values.Name))
+	Expect(pdb.Namespace).To(Equal(expectedNamespace))
+	Expect(pdb.OwnerReferences).To(Equal([]metav1.OwnerReference{values.OwnerReference}))
+	Expect(pdb.Labels).To(Equal(pdbLabels(values)))
 	Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", values.MinAvailable))
 	Expect(pdb.Spec.Selector).To(Equal(pdbSelectorLabels(values)))
 }
 
-func checkV1PDB(pdb *policyv1.PodDisruptionBudget, values *Values) {
-	checkPDBMetadata(&pdb.ObjectMeta, values)
-
+func checkV1PDB(pdb *policyv1.PodDisruptionBudget, values *Values, expectedNamespace string) {
+	Expect(pdb.Name).To(Equal(values.Name))
+	Expect(pdb.Namespace).To(Equal(expectedNamespace))
+	Expect(pdb.OwnerReferences).To(Equal([]metav1.OwnerReference{values.OwnerReference}))
+	Expect(pdb.Labels).To(Equal(pdbLabels(values)))
 	Expect(pdb.Spec.MinAvailable.IntVal).To(BeNumerically("==", values.MinAvailable))
 	Expect(pdb.Spec.Selector).To(Equal(pdbSelectorLabels(values)))
-}
-
-func checkPDBMetadata(meta *metav1.ObjectMeta, values *Values) {
-	Expect(meta.Name).To(Equal(values.EtcdName))
-	Expect(meta.Namespace).To(Equal(values.EtcdNameSpace))
-	Expect(meta.OwnerReferences).To(ConsistOf(Equal(metav1.OwnerReference{
-		APIVersion:         druidv1alpha1.GroupVersion.String(),
-		Kind:               "Etcd",
-		Name:               values.EtcdName,
-		UID:                values.EtcdUID,
-		Controller:         pointer.Bool(true),
-		BlockOwnerDeletion: pointer.Bool(true),
-	})))
-	Expect(meta.Labels).To(Equal(pdbLabels(values)))
 }
 
 func pdbLabels(val *Values) map[string]string {
-	labels := map[string]string{
+	return map[string]string{
 		"name":     "etcd",
-		"instance": val.EtcdName,
-		"app":      "etcd-statefulset",
-		"role":     "main",
+		"instance": val.Name,
 	}
-
-	return labels
 }
 
 func pdbSelectorLabels(val *Values) *metav1.LabelSelector {
-	labels := metav1.LabelSelector{
+	return &metav1.LabelSelector{
 		MatchLabels: map[string]string{
-			"instance": val.EtcdName,
+			"instance": val.Name,
 			"name":     "etcd",
 		},
 	}
-
-	return &labels
 }

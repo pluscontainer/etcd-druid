@@ -20,7 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // Values contains the values necessary for creating ETCD statefulset.
@@ -30,8 +29,8 @@ type Values struct {
 	// Namespace is the namespace of StatefulSet.
 	Namespace string
 
-	// Name is the UID of the etcd resource.
-	EtcdUID types.UID
+	// OwnerReference is the OwnerReference for the StatefulSet.
+	OwnerReference metav1.OwnerReference
 
 	// Replicas is the number of ETCD instance that the ETCD cluster will have.
 	Replicas int32
@@ -40,8 +39,10 @@ type Values struct {
 
 	// Annotations is the annotation provided in ETCD spec.
 	Annotations map[string]string
-	// Labels is the labels provided in ETCD spec.
+	// Labels is the labels of StatefulSet..
 	Labels map[string]string
+	// AdditionalPodLabels represents additional labels to be applied to the StatefulSet pods.
+	AdditionalPodLabels map[string]string
 	// BackupImage is the backup restore image.
 	BackupImage string
 	// EtcdImage is the etcd custom image.
@@ -113,8 +114,10 @@ type Values struct {
 	PeerServiceName string
 	// ServerPort is the peer port.
 	ServerPort *int32
-	// ServerPort is the backup-restore side-car port.
+	// BackupPort is the backup-restore side-car port.
 	BackupPort *int32
+	// WrapperPort is the port where etcd-wrapper registers and exposes it's ready endpoint
+	WrapperPort *int32
 
 	// AutoCompactionMode defines the auto-compaction-mode: 'periodic' or 'revision'.
 	AutoCompactionMode *druidv1alpha1.CompactionMode
@@ -123,4 +126,7 @@ type Values struct {
 	// ConfigMapName is the name of the configmap that holds the ETCD config.
 	ConfigMapName           string
 	PeerTLSChangedToEnabled bool
+
+	// UseEtcdWrapper enables the use of etcd-wrapper image and a compatible version of etcd-backup-restore
+	UseEtcdWrapper bool
 }

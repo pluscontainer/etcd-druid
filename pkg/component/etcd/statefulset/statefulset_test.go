@@ -27,7 +27,7 @@ import (
 	druidutils "github.com/gardener/etcd-druid/pkg/utils"
 	testutils "github.com/gardener/etcd-druid/test/utils"
 
-	"github.com/gardener/gardener/pkg/operation/botanist/component"
+	"github.com/gardener/gardener/pkg/component"
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	. "github.com/gardener/gardener/pkg/utils/test/matchers"
 	"github.com/go-logr/logr"
@@ -41,6 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -60,9 +61,10 @@ var (
 	clientPort              int32 = 2379
 	serverPort              int32 = 2380
 	backupPort              int32 = 8080
+	wrapperPort             int32 = 9095
 	uid                           = "a9b8c7d6e5f4"
-	imageEtcd                     = "eu.gcr.io/gardener-project/gardener/etcd:v3.4.13-bootstrap"
-	imageBR                       = "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.12.0"
+	imageEtcd                     = "eu.gcr.io/gardener-project/gardener/etcd-wrapper:v0.1.0"
+	imageBR                       = "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.25.0"
 	snapshotSchedule              = "0 */24 * * *"
 	defragSchedule                = "0 */24 * * *"
 	container                     = "default.bkp"
@@ -138,8 +140,14 @@ var _ = Describe("Statefulset", func() {
 			pointer.Int32(backupPort),
 			imageEtcd,
 			imageBR,
-			checkSumAnnotations, false)
-		stsDeployer = New(cl, logr.Discard(), values)
+			checkSumAnnotations,
+			false,
+			true,
+		)
+		fg := map[featuregate.Feature]bool{
+			"UseEtcdWrapper": true,
+		}
+		stsDeployer = New(cl, logr.Discard(), values, fg)
 
 		sts = &appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{
@@ -362,9 +370,9 @@ func checkBackup(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet) {
 	backupRestoreContainer := sts.Spec.Template.Spec.Containers[1]
 	Expect(backupRestoreContainer.Name).To(Equal(backupRestore))
 
-	mountPath := "/root/etcd-backup/"
+	mountPath := "/var/etcd-backup/"
 	if *etcd.Spec.Backup.Store.Provider == druidutils.GCS {
-		mountPath = "/root/.gcp/"
+		mountPath = "/var/.gcp/"
 	}
 
 	// Check volume mount
@@ -374,14 +382,14 @@ func checkBackup(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet) {
 	}))
 
 	// Check command
-	Expect(backupRestoreContainer.Command).To(ContainElements(
+	Expect(backupRestoreContainer.Args).To(ContainElements(
 		"--storage-provider="+string(*etcd.Spec.Backup.Store.Provider),
 		"--store-prefix="+prefix,
 	))
 
 	var (
 		envVarName  string
-		envVarValue = "/root/etcd-backup"
+		envVarValue = "/var/etcd-backup"
 	)
 
 	switch *etcd.Spec.Backup.Store.Provider {
@@ -393,7 +401,7 @@ func checkBackup(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet) {
 
 	case druidutils.GCS:
 		envVarName = "GOOGLE_APPLICATION_CREDENTIALS"
-		envVarValue = "/root/.gcp/serviceaccount.json"
+		envVarValue = "/var/.gcp/serviceaccount.json"
 
 	case druidutils.Swift:
 		envVarName = "OPENSTACK_APPLICATION_CREDENTIALS"
@@ -431,7 +439,6 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 			"Labels": MatchAllKeys(Keys{
 				"name":     Equal("etcd"),
 				"instance": Equal(values.Name),
-				"foo":      Equal("bar"),
 			}),
 		}),
 
@@ -454,9 +461,9 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 						"instance": Equal(values.Name),
 					}),
 					"Labels": MatchAllKeys(Keys{
+						"foo":      Equal("bar"),
 						"name":     Equal("etcd"),
 						"instance": Equal(values.Name),
-						"foo":      Equal("bar"),
 					}),
 				}),
 				//s.Spec.Template.Spec.HostAliases
@@ -485,8 +492,14 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 									ContainerPort: *values.ClientPort,
 								},
 							}),
-							"Command": MatchAllElements(cmdIterator, Elements{
-								"/var/etcd/bin/bootstrap.sh": Equal("/var/etcd/bin/bootstrap.sh"),
+							"Args": MatchAllElements(cmdIterator, Elements{
+								"start-etcd":                        Equal("start-etcd"),
+								"--backup-restore-tls-enabled=true": Equal("--backup-restore-tls-enabled=true"),
+								"--etcd-client-cert-path=/var/etcd/ssl/client/client/tls.crt":                  Equal("--etcd-client-cert-path=/var/etcd/ssl/client/client/tls.crt"),
+								"--etcd-client-key-path=/var/etcd/ssl/client/client/tls.key":                   Equal("--etcd-client-key-path=/var/etcd/ssl/client/client/tls.key"),
+								"--backup-restore-ca-cert-bundle-path=/var/etcd/ssl/client/ca/ca.crt":          Equal("--backup-restore-ca-cert-bundle-path=/var/etcd/ssl/client/ca/ca.crt"),
+								fmt.Sprintf("--backup-restore-host-port=%s-local:%d", values.Name, backupPort): Equal(fmt.Sprintf("--backup-restore-host-port=%s-local:%d", values.Name, backupPort)),
+								fmt.Sprintf("--etcd-server-name=%s-local", values.Name):                        Equal(fmt.Sprintf("--etcd-server-name=%s-local", values.Name)),
 							}),
 							"ImagePullPolicy": Equal(corev1.PullIfNotPresent),
 							"Image":           Equal(values.EtcdImage),
@@ -526,19 +539,18 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 						}),
 
 						backupRestore: MatchFields(IgnoreExtras, Fields{
-							"Command": MatchAllElements(cmdIterator, Elements{
-								"etcdbrctl": Equal("etcdbrctl"),
-								"server":    Equal("server"),
-								"--cert=/var/etcd/ssl/client/client/tls.crt":                  Equal("--cert=/var/etcd/ssl/client/client/tls.crt"),
-								"--key=/var/etcd/ssl/client/client/tls.key":                   Equal("--key=/var/etcd/ssl/client/client/tls.key"),
-								"--cacert=/var/etcd/ssl/client/ca/ca.crt":                     Equal("--cacert=/var/etcd/ssl/client/ca/ca.crt"),
-								"--server-cert=/var/etcd/ssl/client/server/tls.crt":           Equal("--server-cert=/var/etcd/ssl/client/server/tls.crt"),
-								"--server-key=/var/etcd/ssl/client/server/tls.key":            Equal("--server-key=/var/etcd/ssl/client/server/tls.key"),
-								"--data-dir=/var/etcd/data/new.etcd":                          Equal("--data-dir=/var/etcd/data/new.etcd"),
-								"--restoration-temp-snapshots-dir=/var/etcd/restoration.temp": Equal("--restoration-temp-snapshots-dir=/var/etcd/restoration.temp"),
-								"--insecure-transport=false":                                  Equal("--insecure-transport=false"),
-								"--insecure-skip-tls-verify=false":                            Equal("--insecure-skip-tls-verify=false"),
-								"--snapstore-temp-directory=/var/etcd/data/temp":              Equal("--snapstore-temp-directory=/var/etcd/data/temp"),
+							"Args": MatchAllElements(cmdIterator, Elements{
+								"server": Equal("server"),
+								"--cert=/var/etcd/ssl/client/client/tls.crt":                       Equal("--cert=/var/etcd/ssl/client/client/tls.crt"),
+								"--key=/var/etcd/ssl/client/client/tls.key":                        Equal("--key=/var/etcd/ssl/client/client/tls.key"),
+								"--cacert=/var/etcd/ssl/client/ca/ca.crt":                          Equal("--cacert=/var/etcd/ssl/client/ca/ca.crt"),
+								"--server-cert=/var/etcd/ssl/client/server/tls.crt":                Equal("--server-cert=/var/etcd/ssl/client/server/tls.crt"),
+								"--server-key=/var/etcd/ssl/client/server/tls.key":                 Equal("--server-key=/var/etcd/ssl/client/server/tls.key"),
+								"--data-dir=/var/etcd/data/new.etcd":                               Equal("--data-dir=/var/etcd/data/new.etcd"),
+								"--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp": Equal("--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp"),
+								"--insecure-transport=false":                                       Equal("--insecure-transport=false"),
+								"--insecure-skip-tls-verify=false":                                 Equal("--insecure-skip-tls-verify=false"),
+								"--snapstore-temp-directory=/var/etcd/data/temp":                   Equal("--snapstore-temp-directory=/var/etcd/data/temp"),
 								fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", etcdLeaderElectionConnectionTimeout.Duration.String()): Equal(fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", values.LeaderElection.EtcdConnectionTimeout.Duration.String())),
 								"--etcd-connection-timeout=5m":                                                                        Equal("--etcd-connection-timeout=5m"),
 								"--enable-snapshot-lease-renewal=true":                                                                Equal("--enable-snapshot-lease-renewal=true"),
@@ -584,7 +596,7 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 								}),
 								"etcd-backup": MatchFields(IgnoreExtras, Fields{
 									"Name":      Equal("etcd-backup"),
-									"MountPath": Equal("/root/etcd-backup/"),
+									"MountPath": Equal("/var/etcd-backup/"),
 								}),
 							}),
 							"Env": MatchElements(envIterator, IgnoreExtras, Elements{
@@ -610,7 +622,7 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 								}),
 								"AZURE_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
 									"Name":  Equal("AZURE_APPLICATION_CREDENTIALS"),
-									"Value": Equal("/root/etcd-backup"),
+									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
 							"Resources": Equal(backupRestoreResources),
@@ -630,7 +642,7 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 							"VolumeSource": MatchFields(IgnoreExtras, Fields{
 								"ConfigMap": PointTo(MatchFields(IgnoreExtras, Fields{
 									"LocalObjectReference": MatchFields(IgnoreExtras, Fields{
-										"Name": Equal(fmt.Sprintf("etcd-bootstrap-%s", string(values.EtcdUID[:6]))),
+										"Name": Equal(fmt.Sprintf("etcd-bootstrap-%s", string(values.OwnerReference.UID[:6]))),
 									}),
 									"DefaultMode": PointTo(Equal(int32(0644))),
 									"Items": MatchAllElements(keyIterator, Elements{
@@ -716,14 +728,7 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 }
 
 func checkStsOwnerRefs(ors []metav1.OwnerReference, values Values) {
-	Expect(ors).To(ConsistOf(Equal(metav1.OwnerReference{
-		APIVersion:         druidv1alpha1.GroupVersion.String(),
-		Kind:               "Etcd",
-		Name:               values.Name,
-		UID:                values.EtcdUID,
-		Controller:         pointer.Bool(true),
-		BlockOwnerDeletion: pointer.Bool(true),
-	})))
+	Expect(ors).To(Equal([]metav1.OwnerReference{values.OwnerReference}))
 }
 
 func getEtcd(name, namespace string, tlsEnabled bool, replicas int32, storageProvider *string) *druidv1alpha1.Etcd {
@@ -872,7 +877,7 @@ func cmdIterator(element interface{}) string {
 
 func getReadinessHandler(val Values) gomegatypes.GomegaMatcher {
 	if val.Replicas > 1 {
-		return getReadinessHandlerForMultiNode(val)
+		return getReadinessHandlerForMultiNode()
 	}
 	return getReadinessHandlerForSingleNode()
 }
@@ -887,14 +892,12 @@ func getReadinessHandlerForSingleNode() gomegatypes.GomegaMatcher {
 	})
 }
 
-func getReadinessHandlerForMultiNode(val Values) gomegatypes.GomegaMatcher {
+func getReadinessHandlerForMultiNode() gomegatypes.GomegaMatcher {
 	return MatchFields(IgnoreExtras, Fields{
-		"Exec": PointTo(MatchFields(IgnoreExtras, Fields{
-			"Command": ConsistOf(
-				"/bin/sh",
-				"-ec",
-				fmt.Sprintf("ETCDCTL_API=3 etcdctl --cacert=/var/etcd/ssl/client/ca/ca.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key --endpoints=https://%s-local:%d get foo --consistency=l", val.Name, clientPort),
-			),
+		"HTTPGet": PointTo(MatchFields(IgnoreExtras, Fields{
+			"Path":   Equal("/readyz"),
+			"Port":   Equal(intstr.FromInt(int(wrapperPort))),
+			"Scheme": Equal(corev1.URISchemeHTTPS),
 		})),
 	})
 }
@@ -917,7 +920,7 @@ func checkLocalProviderVaues(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet, 
 	ExpectWithOffset(1, backupRestoreContainer.Name).To(Equal(backupRestore))
 
 	// Check command
-	ExpectWithOffset(1, backupRestoreContainer.Command).To(ContainElements(
+	ExpectWithOffset(1, backupRestoreContainer.Args).To(ContainElements(
 		"--storage-provider="+string(*etcd.Spec.Backup.Store.Provider),
 		"--store-prefix="+prefix,
 	))
@@ -925,6 +928,6 @@ func checkLocalProviderVaues(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet, 
 	// check volume mount
 	ExpectWithOffset(1, backupRestoreContainer.VolumeMounts).To(ContainElement(corev1.VolumeMount{
 		Name:      "host-storage",
-		MountPath: container,
+		MountPath: "/home/nonroot/" + container,
 	}))
 }

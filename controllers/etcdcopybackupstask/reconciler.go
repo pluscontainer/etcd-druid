@@ -23,6 +23,7 @@ import (
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	"github.com/gardener/etcd-druid/controllers/utils"
 	"github.com/gardener/etcd-druid/pkg/common"
+	"github.com/gardener/etcd-druid/pkg/features"
 	druidutils "github.com/gardener/etcd-druid/pkg/utils"
 	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
 	"github.com/gardener/gardener/pkg/controllerutils"
@@ -99,7 +100,7 @@ func (r *Reconciler) reconcile(ctx context.Context, task *druidv1alpha1.EtcdCopy
 
 	// Ensure finalizer
 	if !controllerutil.ContainsFinalizer(task, common.FinalizerName) {
-		logger.V(1).Info("Adding finalizer")
+		logger.V(1).Info("Adding finalizer", "finalizerName", common.FinalizerName)
 		if err := controllerutils.AddFinalizers(ctx, r.Client, task, common.FinalizerName); err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not add finalizer: %w", err)
 		}
@@ -147,7 +148,7 @@ func (r *Reconciler) doReconcile(ctx context.Context, task *druidv1alpha1.EtcdCo
 	}
 
 	// Create job
-	logger.Info("Creating job", "job", kutil.ObjectName(job))
+	logger.Info("Creating job", "namespace", job.Namespace, "name", job.Name)
 	if err := r.Create(ctx, job); err != nil {
 		return status, fmt.Errorf("could not create job %s: %w", kutil.ObjectName(job), err)
 	}
@@ -160,7 +161,7 @@ func (r *Reconciler) delete(ctx context.Context, task *druidv1alpha1.EtcdCopyBac
 
 	// Check finalizer
 	if !controllerutil.ContainsFinalizer(task, common.FinalizerName) {
-		logger.V(1).Info("Skipping as it does not have a finalizer")
+		logger.V(1).Info("Skipping since finalizer not present", "finalizerName", common.FinalizerName)
 		return ctrl.Result{}, nil
 	}
 
@@ -185,7 +186,7 @@ func (r *Reconciler) delete(ctx context.Context, task *druidv1alpha1.EtcdCopyBac
 
 	// Remove finalizer if requested
 	if removeFinalizer {
-		logger.V(1).Info("Removing finalizer")
+		logger.V(1).Info("Removing finalizer", "finalizerName", common.FinalizerName)
 		if err := controllerutils.RemoveFinalizers(ctx, r.Client, task, common.FinalizerName); err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not remove finalizer: %w", err)
 		}
@@ -213,7 +214,7 @@ func (r *Reconciler) doDelete(ctx context.Context, task *druidv1alpha1.EtcdCopyB
 
 	// Delete job if needed
 	if job.DeletionTimestamp == nil {
-		logger.Info("Deleting job", "job", kutil.ObjectName(job))
+		logger.Info("Deleting job", "namespace", job.Namespace, "name", job.Name)
 		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
 			return status, false, fmt.Errorf("could not delete job %s: %w", kutil.ObjectName(job), err)
 		}
@@ -284,7 +285,7 @@ func getConditionType(jobConditionType batchv1.JobConditionType) druidv1alpha1.C
 }
 
 func (r *Reconciler) createJobObject(ctx context.Context, task *druidv1alpha1.EtcdCopyBackupsTask) (*batchv1.Job, error) {
-	etcdBackupImage, err := druidutils.GetEtcdBackupRestoreImage(r.imageVector)
+	etcdBackupImage, err := druidutils.GetEtcdBackupRestoreImage(r.imageVector, r.Config.FeatureGates[features.UseEtcdWrapper])
 	if err != nil {
 		return nil, err
 	}
@@ -301,14 +302,14 @@ func (r *Reconciler) createJobObject(ctx context.Context, task *druidv1alpha1.Et
 		return nil, err
 	}
 
-	// Formulate the job's command.
-	command := createJobCommand(task, sourceProvider, targetProvider)
+	// Formulate the job's arguments.
+	args := createJobArgs(task, sourceProvider, targetProvider)
 
 	// Formulate the job environment variables.
 	env := append(createEnvVarsFromStore(&sourceStore, sourceProvider, "SOURCE_", sourcePrefix), createEnvVarsFromStore(&targetStore, targetProvider, "", "")...)
 
 	// Formulate the job's volume mounts.
-	volumeMounts := append(createVolumeMountsFromStore(&sourceStore, sourceProvider, sourcePrefix), createVolumeMountsFromStore(&targetStore, targetProvider, targetPrefix)...)
+	volumeMounts := append(createVolumeMountsFromStore(&sourceStore, sourceProvider, sourcePrefix, r.Config.FeatureGates[features.UseEtcdWrapper]), createVolumeMountsFromStore(&targetStore, targetProvider, targetPrefix, r.Config.FeatureGates[features.UseEtcdWrapper])...)
 
 	// Formulate the job's volumes from the source store.
 	sourceVolumes, err := r.createVolumesFromStore(ctx, &sourceStore, task.Namespace, sourceProvider, sourcePrefix)
@@ -349,15 +350,42 @@ func (r *Reconciler) createJobObject(ctx context.Context, task *druidv1alpha1.Et
 							Name:            "copy-backups",
 							Image:           *etcdBackupImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command:         command,
+							Args:            args,
 							Env:             env,
 							VolumeMounts:    volumeMounts,
 						},
 					},
-					Volumes: volumes,
+					ShareProcessNamespace: pointer.Bool(true),
+					Volumes:               volumes,
 				},
 			},
 		},
+	}
+
+	if r.Config.FeatureGates[features.UseEtcdWrapper] {
+		if targetProvider == druidutils.Local {
+			// init container to change file permissions of the folders used as store to 65532 (nonroot)
+			// used only with local provider
+			job.Spec.Template.Spec.InitContainers = []corev1.Container{
+				{
+					Name:         "change-backup-bucket-permissions",
+					Image:        "alpine:3.18.2",
+					Command:      []string{"sh", "-c", "--"},
+					Args:         []string{fmt.Sprintf("%s%s%s%s", "chown -R 65532:65532 /home/nonroot/", *targetStore.Container, " /home/nonroot/", *sourceStore.Container)},
+					VolumeMounts: volumeMounts,
+					SecurityContext: &corev1.SecurityContext{
+						RunAsGroup:   pointer.Int64(0),
+						RunAsNonRoot: pointer.Bool(false),
+						RunAsUser:    pointer.Int64(0),
+					},
+				},
+			}
+		}
+		job.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsGroup:   pointer.Int64(65532),
+			RunAsNonRoot: pointer.Bool(true),
+			RunAsUser:    pointer.Int64(65532),
+		}
 	}
 
 	if err := controllerutil.SetControllerReference(task, job, r.Scheme()); err != nil {
@@ -366,32 +394,31 @@ func (r *Reconciler) createJobObject(ctx context.Context, task *druidv1alpha1.Et
 	return job, nil
 }
 
-func createJobCommand(task *druidv1alpha1.EtcdCopyBackupsTask, sourceObjStoreProvider string, targetObjStoreProvider string) []string {
-	// Create the initial command for the copy-backups job.
-	command := []string{
-		"etcdbrctl",
+func createJobArgs(task *druidv1alpha1.EtcdCopyBackupsTask, sourceObjStoreProvider string, targetObjStoreProvider string) []string {
+	// Create the initial arguments for the copy-backups job.
+	args := []string{
 		"copy",
-		"--snapstore-temp-directory=/var/etcd/data/tmp",
+		"--snapstore-temp-directory=/home/nonroot/data/tmp",
 	}
 
-	// Formulate the job's command.
-	command = append(command, createJobCommandFromStore(&task.Spec.TargetStore, targetObjStoreProvider, "")...)
-	command = append(command, createJobCommandFromStore(&task.Spec.SourceStore, sourceObjStoreProvider, sourcePrefix)...)
+	// Formulate the job's arguments.
+	args = append(args, createJobArgumentFromStore(&task.Spec.TargetStore, targetObjStoreProvider, "")...)
+	args = append(args, createJobArgumentFromStore(&task.Spec.SourceStore, sourceObjStoreProvider, sourcePrefix)...)
 	if task.Spec.MaxBackupAge != nil {
-		command = append(command, "--max-backup-age="+strconv.Itoa(int(*task.Spec.MaxBackupAge)))
+		args = append(args, "--max-backup-age="+strconv.Itoa(int(*task.Spec.MaxBackupAge)))
 	}
 
 	if task.Spec.MaxBackups != nil {
-		command = append(command, "--max-backups-to-copy="+strconv.Itoa(int(*task.Spec.MaxBackups)))
+		args = append(args, "--max-backups-to-copy="+strconv.Itoa(int(*task.Spec.MaxBackups)))
 	}
 
 	if task.Spec.WaitForFinalSnapshot != nil {
-		command = append(command, "--wait-for-final-snapshot="+strconv.FormatBool(task.Spec.WaitForFinalSnapshot.Enabled))
+		args = append(args, "--wait-for-final-snapshot="+strconv.FormatBool(task.Spec.WaitForFinalSnapshot.Enabled))
 		if task.Spec.WaitForFinalSnapshot.Timeout != nil {
-			command = append(command, "--wait-for-final-snapshot-timeout="+task.Spec.WaitForFinalSnapshot.Timeout.Duration.String())
+			args = append(args, "--wait-for-final-snapshot-timeout="+task.Spec.WaitForFinalSnapshot.Timeout.Duration.String())
 		}
 	}
-	return command
+	return args
 }
 
 // getVolumeNamePrefix returns the appropriate volume name prefix based on the provided prefix.
@@ -444,22 +471,29 @@ func (r *Reconciler) createVolumesFromStore(ctx context.Context, store *druidv1a
 // createVolumesFromStore generates a slice of volumes for an EtcdCopyBackups job based on the given StoreSpec, namespace,
 // provider, and prefix. The prefix is used to differentiate between source and target volumes.
 // This function creates the necessary Volume configurations for various storage providers and returns any errors encountered.
-func createVolumeMountsFromStore(store *druidv1alpha1.StoreSpec, provider, volumeMountPrefix string) (volumeMounts []corev1.VolumeMount) {
+func createVolumeMountsFromStore(store *druidv1alpha1.StoreSpec, provider, volumeMountPrefix string, useEtcdWrapper bool) (volumeMounts []corev1.VolumeMount) {
 	switch provider {
 	case druidutils.Local:
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      volumeMountPrefix + "host-storage",
-			MountPath: *store.Container,
-		})
+		if useEtcdWrapper {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      volumeMountPrefix + "host-storage",
+				MountPath: "/home/nonroot/" + *store.Container,
+			})
+		} else {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      volumeMountPrefix + "host-storage",
+				MountPath: *store.Container,
+			})
+		}
 	case druidutils.GCS:
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      getVolumeNamePrefix(volumeMountPrefix) + "etcd-backup",
-			MountPath: "/root/." + getVolumeNamePrefix(volumeMountPrefix) + "gcp/",
+			MountPath: "/var/." + getVolumeNamePrefix(volumeMountPrefix) + "gcp/",
 		})
 	case druidutils.S3, druidutils.ABS, druidutils.Swift, druidutils.OCS, druidutils.OSS:
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      getVolumeNamePrefix(volumeMountPrefix) + "etcd-backup",
-			MountPath: "/root/" + getVolumeNamePrefix(volumeMountPrefix) + "etcd-backup/",
+			MountPath: "/var/" + getVolumeNamePrefix(volumeMountPrefix) + "etcd-backup/",
 		})
 	}
 	return
@@ -480,39 +514,39 @@ func createEnvVarsFromStore(store *druidv1alpha1.StoreSpec, storeProvider, envKe
 	envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.STORAGE_CONTAINER, *store.Container))
 	switch storeProvider {
 	case druidutils.S3:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.AWS_APPLICATION_CREDENTIALS, "/root/"+volumePrefix+"etcd-backup"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.AWS_APPLICATION_CREDENTIALS, "/var/"+volumePrefix+"etcd-backup"))
 	case druidutils.ABS:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.AZURE_APPLICATION_CREDENTIALS, "/root/"+volumePrefix+"etcd-backup"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.AZURE_APPLICATION_CREDENTIALS, "/var/"+volumePrefix+"etcd-backup"))
 	case druidutils.GCS:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.GOOGLE_APPLICATION_CREDENTIALS, "/root/."+volumePrefix+"gcp/serviceaccount.json"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.GOOGLE_APPLICATION_CREDENTIALS, "/var/."+volumePrefix+"gcp/serviceaccount.json"))
 	case druidutils.Swift:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.OPENSTACK_APPLICATION_CREDENTIALS, "/root/"+volumePrefix+"etcd-backup"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.OPENSTACK_APPLICATION_CREDENTIALS, "/var/"+volumePrefix+"etcd-backup"))
 	case druidutils.OCS:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.OPENSHIFT_APPLICATION_CREDENTIALS, "/root/"+volumePrefix+"etcd-backup"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.OPENSHIFT_APPLICATION_CREDENTIALS, "/var/"+volumePrefix+"etcd-backup"))
 	case druidutils.OSS:
-		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.ALICLOUD_APPLICATION_CREDENTIALS, "/root/"+volumePrefix+"etcd-backup"))
+		envVars = append(envVars, mapToEnvVar(envKeyPrefix+common.ALICLOUD_APPLICATION_CREDENTIALS, "/var/"+volumePrefix+"etcd-backup"))
 	}
 	return envVars
 }
 
-// createJobCommandFromStore generates a slice of command-line arguments for a EtcdCopyBackups job based on the given StoreSpec,
+// createJobArgumentFromStore generates a slice of command-line arguments for a EtcdCopyBackups job based on the given StoreSpec,
 // provider, and prefix. The prefix is used to differentiate between source and target command-line arguments.
 // This function is used to create the necessary command-line arguments for
 // various storage providers and configurations. The generated arguments include storage provider,
 // store prefix, and store container information.
-func createJobCommandFromStore(store *druidv1alpha1.StoreSpec, provider, prefix string) (command []string) {
+func createJobArgumentFromStore(store *druidv1alpha1.StoreSpec, provider, prefix string) (arguments []string) {
 	if store == nil || len(provider) == 0 {
 		return
 	}
-	commandPrefix := "--" + prefix
-	command = append(command, commandPrefix+"storage-provider="+provider)
+	argPrefix := "--" + prefix
+	arguments = append(arguments, argPrefix+"storage-provider="+provider)
 
 	if len(store.Prefix) > 0 {
-		command = append(command, commandPrefix+"store-prefix="+store.Prefix)
+		arguments = append(arguments, argPrefix+"store-prefix="+store.Prefix)
 	}
 
 	if store.Container != nil && len(*store.Container) > 0 {
-		command = append(command, commandPrefix+"store-container="+*store.Container)
+		arguments = append(arguments, argPrefix+"store-container="+*store.Container)
 	}
 	return
 }

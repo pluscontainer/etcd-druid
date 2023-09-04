@@ -17,13 +17,11 @@ package lease
 import (
 	"context"
 
-	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	"github.com/go-logr/logr"
 
-	gardenercomponent "github.com/gardener/gardener/pkg/operation/botanist/component"
+	gardenercomponent "github.com/gardener/gardener/pkg/component"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -52,11 +50,7 @@ func (c *component) Deploy(ctx context.Context) error {
 		return err
 	}
 
-	if err := c.syncMemberLeases(ctx); err != nil {
-		return err
-	}
-
-	return nil
+	return c.syncMemberLeases(ctx)
 }
 
 func (c *component) Destroy(ctx context.Context) error {
@@ -73,11 +67,7 @@ func (c *component) Destroy(ctx context.Context) error {
 		return err
 	}
 
-	if err := c.deleteAllMemberLeases(ctx); err != nil {
-		return err
-	}
-
-	return nil
+	return c.deleteAllMemberLeases(ctx)
 }
 
 // New creates a new lease deployer instance.
@@ -91,25 +81,15 @@ func New(c client.Client, logger logr.Logger, namespace string, values Values) I
 }
 
 func (c *component) emptyLease(name string) *coordinationv1.Lease {
-	labels := map[string]string{"name": "etcd", "instance": c.values.EtcdName}
+	copyLabels := make(map[string]string, len(c.values.Labels))
+	for k, v := range c.values.Labels {
+		copyLabels[k] = v
+	}
 	return &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: c.namespace,
-			Labels:    labels,
-		},
-	}
-}
-
-func getOwnerReferences(val Values) []metav1.OwnerReference {
-	return []metav1.OwnerReference{
-		{
-			APIVersion:         druidv1alpha1.GroupVersion.String(),
-			Kind:               "Etcd",
-			Name:               val.EtcdName,
-			UID:                val.EtcdUID,
-			Controller:         pointer.Bool(true),
-			BlockOwnerDeletion: pointer.Bool(true),
+			Labels:    copyLabels,
 		},
 	}
 }

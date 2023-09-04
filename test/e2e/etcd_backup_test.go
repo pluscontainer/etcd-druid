@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"time"
 
+	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/gardener/etcd-druid/api/v1alpha1"
 
-	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/gardener/gardener/pkg/utils/test/matchers"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
@@ -75,7 +75,7 @@ var _ = Describe("Etcd Backup", func() {
 					Expect(deployBackupSecret(parentCtx, cl, logger, provider, etcdNamespace, storageContainer))
 				})
 
-				It("should create, test backup and delete etcd with backup", func() {
+				It("Should create, test backup and delete etcd with backup", func() {
 					ctx, cancelFunc := context.WithTimeout(parentCtx, 10*time.Minute)
 					defer cancelFunc()
 
@@ -85,10 +85,12 @@ var _ = Describe("Etcd Backup", func() {
 					By("Create etcd")
 					createAndCheckEtcd(ctx, cl, objLogger, etcd, singleNodeEtcdTimeout)
 
-					By("Check initial snapshot is available")
-					var podName = fmt.Sprintf("%s-0", etcdName)
+					By("Create debug pod")
+					debugPod := createDebugPod(ctx, etcd)
 
-					latestSnapshotsBeforePopulate, err := getLatestSnapshots(kubeconfigPath, namespace, etcdName, podName, "backup-restore", 8080)
+					By("Check initial snapshot is available")
+
+					latestSnapshotsBeforePopulate, err := getLatestSnapshots(kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, 8080)
 					Expect(err).ShouldNot(HaveOccurred())
 					// We don't expect any delta snapshot as the cluster
 					Expect(latestSnapshotsBeforePopulate.DeltaSnapshots).To(HaveLen(0))
@@ -97,16 +99,19 @@ var _ = Describe("Etcd Backup", func() {
 					Expect(latestSnapshotBeforePopulate).To(Not(BeNil()))
 
 					By("Put keys into etcd")
-					logger.Info(fmt.Sprintf("populating etcd with %s-1 to %s-10", etcdKeyPrefix, etcdKeyPrefix))
+					logger.Info("populating etcd with sequential key-value pairs",
+						"fromKey", fmt.Sprintf("%s-1", etcdKeyPrefix), "fromValue", fmt.Sprintf("%s-1", etcdValuePrefix),
+						"toKey", fmt.Sprintf("%s-10", etcdKeyPrefix), "toValue", fmt.Sprintf("%s-10", etcdValuePrefix))
+
 					// populate 10 keys in etcd, finishing in 10 seconds
-					err = populateEtcdWithCount(logger, kubeconfigPath, namespace, etcdName, podName, "etcd", etcdKeyPrefix, etcdValuePrefix, 1, 10, time.Second*1)
+					err = populateEtcd(logger, kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, etcdKeyPrefix, etcdValuePrefix, 1, 10, time.Second*1)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					By("Check snapshot after putting data into etcd")
 					// allow 5 second buffer to upload full/delta snapshot
 					time.Sleep(time.Second * 5)
 
-					latestSnapshotsAfterPopulate, err := getLatestSnapshots(kubeconfigPath, namespace, etcdName, podName, "backup-restore", 8080)
+					latestSnapshotsAfterPopulate, err := getLatestSnapshots(kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, 8080)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					latestSnapshotAfterPopulate := latestSnapshotsAfterPopulate.FullSnapshot
@@ -118,22 +123,24 @@ var _ = Describe("Etcd Backup", func() {
 					Expect(latestSnapshotAfterPopulate.CreatedOn.After(latestSnapshotBeforePopulate.CreatedOn)).To(BeTrue())
 
 					By("Trigger on-demand full snapshot")
-					fullSnapshot, err := triggerOnDemandSnapshot(kubeconfigPath, namespace, podName, "backup-restore", 8080, brtypes.SnapshotKindFull)
+					fullSnapshot, err := triggerOnDemandSnapshot(kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, 8080, brtypes.SnapshotKindFull)
 					Expect(err).ShouldNot(HaveOccurred())
 					Expect(fullSnapshot.LastRevision).To(Equal(10 + latestSnapshotBeforePopulate.LastRevision))
 
 					By("Put additional data into etcd")
-					logger.Info(fmt.Sprintf("populating etcd with %s-11 to %s-15", etcdKeyPrefix, etcdKeyPrefix))
+					logger.Info("populating etcd with sequential key-value pairs",
+						"fromKey", fmt.Sprintf("%s-11", etcdKeyPrefix), "fromValue", fmt.Sprintf("%s-11", etcdValuePrefix),
+						"toKey", fmt.Sprintf("%s-15", etcdKeyPrefix), "toValue", fmt.Sprintf("%s-15", etcdValuePrefix))
 					// populate 5 keys in etcd, finishing in 5 seconds
-					err = populateEtcdWithCount(logger, kubeconfigPath, namespace, etcdName, podName, "etcd", etcdKeyPrefix, etcdValuePrefix, 11, 15, time.Second*1)
+					err = populateEtcd(logger, kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, etcdKeyPrefix, etcdValuePrefix, 11, 15, time.Second*1)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					By("Trigger on-demand delta snapshot")
-					_, err = triggerOnDemandSnapshot(kubeconfigPath, namespace, podName, "backup-restore", 8080, brtypes.SnapshotKindDelta)
+					_, err = triggerOnDemandSnapshot(kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, 8080, brtypes.SnapshotKindDelta)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					By("Test cluster restoration by deleting data directory")
-					Expect(deleteDir(kubeconfigPath, namespace, podName, "backup-restore", "/var/etcd/data/new.etcd/member")).To(Succeed())
+					Expect(deleteDir(kubeconfigPath, namespace, debugPod.Name, debugPod.Spec.Containers[0].Name, "/var/etcd/data/new.etcd/member")).To(Succeed())
 
 					logger.Info("waiting for sts to become unready", "statefulSetName", etcdName)
 					Eventually(func() error {
@@ -169,21 +176,41 @@ var _ = Describe("Etcd Backup", func() {
 
 					// verify existence and correctness of keys 1 to 30
 					logger.Info("fetching etcd key-value pairs")
-					keyValueMap, err := getEtcdKeys(logger, kubeconfigPath, namespace, etcdName, podName, "etcd", etcdKeyPrefix, 1, 15)
+					keyValueMap, err := getEtcdKeys(logger, kubeconfigPath, namespace, etcdName, debugPod.Name, debugPod.Spec.Containers[0].Name, etcdKeyPrefix, 1, 15)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					for i := 1; i <= 15; i++ {
 						Expect(keyValueMap[fmt.Sprintf("%s-%d", etcdKeyPrefix, i)]).To(Equal(fmt.Sprintf("%s-%d", etcdValuePrefix, i)))
 					}
 
+					By("Delete debug pod")
+					Expect(cl.Delete(ctx, debugPod)).ToNot(HaveOccurred())
+
 					By("Delete etcd")
 					deleteAndCheckEtcd(ctx, cl, objLogger, etcd, singleNodeEtcdTimeout)
-
 				})
 			})
 		}
 	})
 })
+
+func createDebugPod(ctx context.Context, etcd *v1alpha1.Etcd) *corev1.Pod {
+	debugPod := getDebugPod(etcd)
+	ExpectWithOffset(1, cl.Create(ctx, debugPod)).ShouldNot(HaveOccurred())
+	// Ensure pod is running
+	EventuallyWithOffset(1, func() error {
+		dPod := &corev1.Pod{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: debugPod.Name}, dPod); err != nil {
+			return fmt.Errorf("error occurred while getting pod object: %v ", err)
+		}
+		if dPod.Status.Phase == corev1.PodRunning {
+			return nil
+		}
+		return fmt.Errorf("waiting for pod %v to be ready", dPod.Name)
+	}, 2*time.Minute, pollingInterval).Should(BeNil())
+
+	return debugPod
+}
 
 func createAndCheckEtcd(ctx context.Context, cl client.Client, logger logr.Logger, etcd *v1alpha1.Etcd, timeout time.Duration) {
 	ExpectWithOffset(1, cl.Create(ctx, etcd)).ShouldNot(HaveOccurred())
@@ -203,15 +230,6 @@ func checkEtcdReady(ctx context.Context, cl client.Client, logger logr.Logger, e
 
 		if etcd.Status.Ready == nil || *etcd.Status.Ready != true {
 			return fmt.Errorf("etcd %s is not ready", etcd.Name)
-		}
-
-		if etcd.Status.ClusterSize == nil {
-			return fmt.Errorf("etcd %s cluster size is empty", etcd.Name)
-		}
-
-		if *etcd.Status.ClusterSize != etcd.Spec.Replicas {
-			return fmt.Errorf("etcd %s cluster size is %v, but it's not expected size as %v",
-				etcd.Name, etcd.Status.ClusterSize, etcd.Spec.Replicas)
 		}
 
 		if len(etcd.Status.Conditions) == 0 {

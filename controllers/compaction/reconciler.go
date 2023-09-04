@@ -22,6 +22,7 @@ import (
 
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
 	ctrlutils "github.com/gardener/etcd-druid/controllers/utils"
+	"github.com/gardener/etcd-druid/pkg/features"
 	druidmetrics "github.com/gardener/etcd-druid/pkg/metrics"
 	"github.com/gardener/etcd-druid/pkg/utils"
 	"github.com/gardener/gardener/pkg/utils/imagevector"
@@ -110,7 +111,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	fullLease := &coordinationv1.Lease{}
 
 	if err := r.Get(ctx, kutil.Key(etcd.Namespace, etcd.GetFullSnapshotLeaseName()), fullLease); err != nil {
-		logger.Info("Couldn't fetch full snap lease because: " + err.Error())
+		logger.Error(err, "Couldn't fetch full snap lease", "namespace", etcd.Namespace, "name", etcd.GetFullSnapshotLeaseName())
 
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
@@ -119,7 +120,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	deltaLease := &coordinationv1.Lease{}
 	if err := r.Get(ctx, kutil.Key(etcd.Namespace, etcd.GetDeltaSnapshotLeaseName()), deltaLease); err != nil {
-		logger.Info("Couldn't fetch delta snap lease because: " + err.Error())
+		logger.Error(err, "Couldn't fetch delta snap lease", "namespace", etcd.Namespace, "name", etcd.GetDeltaSnapshotLeaseName())
 
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
@@ -134,7 +135,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	full, err := strconv.ParseInt(*fullLease.Spec.HolderIdentity, 10, 64)
 	if err != nil {
-		logger.Error(err, "Can't convert holder identity of full snap lease to integer")
+		logger.Error(err, "Can't convert holder identity of full snap lease to integer",
+			"namespace", fullLease.Namespace, "leaseName", fullLease.Name, "holderIdentity", fullLease.Spec.HolderIdentity)
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
 		}, err
@@ -142,7 +144,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	delta, err := strconv.ParseInt(*deltaLease.Spec.HolderIdentity, 10, 64)
 	if err != nil {
-		logger.Error(err, "Can't convert holder identity of delta snap lease to integer")
+		logger.Error(err, "Can't convert holder identity of delta snap lease to integer",
+			"namespace", deltaLease.Namespace, "leaseName", deltaLease.Name, "holderIdentity", deltaLease.Spec.HolderIdentity)
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
 		}, err
@@ -175,8 +178,8 @@ func (r *Reconciler) reconcileJob(ctx context.Context, logger logr.Logger, etcd 
 
 		if r.config.EnableBackupCompaction {
 			// Required job doesn't exist. Create new
+			logger.Info("Creating etcd compaction job", "namespace", etcd.Namespace, "name", etcd.GetCompactionJobName())
 			job, err = r.createCompactionJob(ctx, logger, etcd)
-			logger.Info("Job Creation")
 			if err != nil {
 				return ctrl.Result{
 					RequeueAfter: 10 * time.Second,
@@ -187,14 +190,15 @@ func (r *Reconciler) reconcileJob(ctx context.Context, logger logr.Logger, etcd 
 	}
 
 	if !job.DeletionTimestamp.IsZero() {
-		logger.Info(fmt.Sprintf("Job %s/%s is already in deletion. A new job will only be created if the previous one has been deleted.", job.Namespace, job.Name))
+		logger.Info("Job is already in deletion. A new job will be created only if the previous one has been deleted.", "namespace", job.Namespace, "name", job.Name)
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
 		}, nil
 	}
 
 	if job.Name != "" {
-		logger.Info(fmt.Sprintf("Current compaction job is %s/%s , status: %d", job.Namespace, job.Name, job.Status.Succeeded))
+		logger.Info("Current compaction job status",
+			"namespace", job.Namespace, "name", job.Name, "succeeded", job.Status.Succeeded)
 	}
 
 	// Delete job and requeue if the job failed
@@ -239,7 +243,7 @@ func (r *Reconciler) delete(ctx context.Context, logger logr.Logger, etcd *druid
 	}
 
 	if job.DeletionTimestamp == nil {
-		logger.Info("Deleting job", "job", kutil.ObjectName(job))
+		logger.Info("Deleting job", "namespace", job.Namespace, "name", job.Name)
 		if err := client.IgnoreNotFound(r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground))); err != nil {
 			return ctrl.Result{
 				RequeueAfter: 10 * time.Second,
@@ -256,7 +260,7 @@ func (r *Reconciler) delete(ctx context.Context, logger logr.Logger, etcd *druid
 func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) (*batchv1.Job, error) {
 	activeDeadlineSeconds := r.config.ActiveDeadlineDuration.Seconds()
 
-	_, etcdBackupImage, err := utils.GetEtcdImages(etcd, r.imageVector)
+	_, etcdBackupImage, err := utils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
 	if err != nil {
 		return nil, fmt.Errorf("couldn't fetch etcd backup image: %v", err)
 	}
@@ -268,7 +272,7 @@ func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger
 			Labels:    getLabels(etcd),
 			OwnerReferences: []metav1.OwnerReference{
 				{
-					APIVersion:         "druid.gardener.cloud/v1alpha1",
+					APIVersion:         druidv1alpha1.GroupVersion.String(),
 					BlockOwnerDeletion: pointer.Bool(true),
 					Controller:         pointer.Bool(true),
 					Kind:               "Etcd",
@@ -295,7 +299,7 @@ func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger
 						Name:            "compact-backup",
 						Image:           *etcdBackupImage,
 						ImagePullPolicy: v1.PullIfNotPresent,
-						Command:         getCompactionJobCommands(etcd),
+						Args:            getCompactionJobArgs(etcd),
 						VolumeMounts:    getCompactionJobVolumeMounts(etcd, logger),
 						Env:             getCompactionJobEnvVar(etcd, logger),
 					}},
@@ -309,7 +313,7 @@ func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger
 		job.Spec.Template.Spec.Containers[0].Resources = *etcd.Spec.Backup.CompactionResources
 	}
 
-	logger.Info("Creating job", "job", kutil.Key(job.Namespace, job.Name).String())
+	logger.Info("Creating job", "namespace", job.Namespace, "name", job.Name)
 	err = r.Create(ctx, job)
 	if err != nil {
 		return nil, err
@@ -343,19 +347,19 @@ func getCompactionJobVolumeMounts(etcd *druidv1alpha1.Etcd, logger logr.Logger) 
 
 	provider, err := utils.StorageProviderFromInfraProvider(etcd.Spec.Backup.Store.Provider)
 	if err != nil {
-		logger.Info("Storage provider is not recognized. Compaction job will not mount any volume with provider specific credentials.")
+		logger.Error(err, "Storage provider is not recognized. Compaction job will not mount any volume with provider specific credentials", "namespace", etcd.Namespace, "name", etcd.Name)
 		return vms
 	}
 
 	if provider == utils.GCS {
 		vms = append(vms, v1.VolumeMount{
 			Name:      "etcd-backup",
-			MountPath: "/root/.gcp/",
+			MountPath: "/var/.gcp/",
 		})
 	} else if provider == utils.S3 || provider == utils.ABS || provider == utils.OSS || provider == utils.Swift || provider == utils.OCS {
 		vms = append(vms, v1.VolumeMount{
 			Name:      "etcd-backup",
-			MountPath: "/root/etcd-backup/",
+			MountPath: "/var/etcd-backup/",
 		})
 	}
 
@@ -379,13 +383,14 @@ func getCompactionJobVolumes(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.
 	storeValues := etcd.Spec.Backup.Store
 	provider, err := utils.StorageProviderFromInfraProvider(storeValues.Provider)
 	if err != nil {
-		logger.Info("Storage provider is not recognized. Compaction job will fail as no storage could be configured.")
+		logger.Error(err, "Storage provider is not recognized. Compaction job will fail as no storage could be configured", "namespace", etcd.Namespace, "name", etcd.Name)
 		return vs
 	}
 
 	if provider == utils.GCS || provider == utils.S3 || provider == utils.OSS || provider == utils.ABS || provider == utils.Swift || provider == utils.OCS {
 		if storeValues.SecretRef == nil {
-			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.")
+			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.",
+				"namespace", etcd.Namespace, "name", etcd.Name)
 			return vs
 		}
 
@@ -415,24 +420,25 @@ func getCompactionJobEnvVar(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.E
 
 	provider, err := utils.StorageProviderFromInfraProvider(etcd.Spec.Backup.Store.Provider)
 	if err != nil {
-		logger.Info("Storage provider is not recognized. Compaction job will likely fail as there is no provider specific credentials.")
+		logger.Error(err, "Storage provider is not recognized. Compaction job will likely fail as there is no provider specific credentials.", "namespace", etcd.Namespace, "name", etcd.Name)
 		return env
 	}
 
 	switch provider {
 	case utils.S3:
-		env = append(env, getEnvVarFromValues("AWS_APPLICATION_CREDENTIALS", "/root/etcd-backup"))
+		env = append(env, getEnvVarFromValues("AWS_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
 	case utils.ABS:
-		env = append(env, getEnvVarFromValues("AZURE_APPLICATION_CREDENTIALS", "/root/etcd-backup"))
+		env = append(env, getEnvVarFromValues("AZURE_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
 	case utils.GCS:
-		env = append(env, getEnvVarFromValues("GOOGLE_APPLICATION_CREDENTIALS", "/root/.gcp/serviceaccount.json"))
+		env = append(env, getEnvVarFromValues("GOOGLE_APPLICATION_CREDENTIALS", "/var/.gcp/serviceaccount.json"))
 	case utils.Swift:
-		env = append(env, getEnvVarFromValues("OPENSTACK_APPLICATION_CREDENTIALS", "/root/etcd-backup"))
+		env = append(env, getEnvVarFromValues("OPENSTACK_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
 	case utils.OSS:
-		env = append(env, getEnvVarFromValues("ALICLOUD_APPLICATION_CREDENTIALS", "/root/etcd-backup"))
+		env = append(env, getEnvVarFromValues("ALICLOUD_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
 	case utils.ECS:
 		if storeValues.SecretRef == nil {
-			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.")
+			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.",
+				"namespace", etcd.Namespace, "name", etcd.Name)
 			return env
 		}
 
@@ -440,7 +446,7 @@ func getCompactionJobEnvVar(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.E
 		env = append(env, getEnvVarFromSecrets("ECS_ACCESS_KEY_ID", storeValues.SecretRef.Name, "accessKeyID"))
 		env = append(env, getEnvVarFromSecrets("ECS_SECRET_ACCESS_KEY", storeValues.SecretRef.Name, "secretAccessKey"))
 	case utils.OCS:
-		env = append(env, getEnvVarFromValues("OPENSHIFT_APPLICATION_CREDENTIALS", "/root/etcd-backup"))
+		env = append(env, getEnvVarFromValues("OPENSHIFT_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
 	}
 
 	return env
@@ -478,11 +484,10 @@ func getEnvVarFromSecrets(name, secretName, secretKey string) v1.EnvVar {
 	}
 }
 
-func getCompactionJobCommands(etcd *druidv1alpha1.Etcd) []string {
-	command := []string{"" + "etcdbrctl"}
-	command = append(command, "compact")
+func getCompactionJobArgs(etcd *druidv1alpha1.Etcd) []string {
+	command := []string{"compact"}
 	command = append(command, "--data-dir=/var/etcd/data/compaction.etcd")
-	command = append(command, "--restoration-temp-snapshots-dir=/var/etcd/compaction.restoration.temp")
+	command = append(command, "--restoration-temp-snapshots-dir=/var/etcd/data/compaction.restoration.temp")
 	command = append(command, "--snapstore-temp-directory=/var/etcd/data/tmp")
 	command = append(command, "--enable-snapshot-lease-renewal=true")
 	command = append(command, "--full-snapshot-lease-name="+etcd.GetFullSnapshotLeaseName())

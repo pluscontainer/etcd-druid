@@ -129,7 +129,6 @@ var _ = Describe("Etcd", func() {
 
 	Context("GetAsOwnerReference", func() {
 		It("should return an OwnerReference object that represents the current Etcd instance", func() {
-
 			expected := metav1.OwnerReference{
 				APIVersion:         GroupVersion.String(),
 				Kind:               "Etcd",
@@ -169,8 +168,8 @@ func getEtcd(name, namespace string) *Etcd {
 	deltaSnapshotPeriod := metav1.Duration{
 		Duration: 300 * time.Second,
 	}
-	imageEtcd := "eu.gcr.io/gardener-project/gardener/etcd:v3.4.13-bootstrap-10"
-	imageBR := "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.20.2"
+	imageEtcd := "eu.gcr.io/gardener-project/gardener/etcd-wrapper:v0.1.0"
+	imageBR := "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.25.0"
 	snapshotSchedule := "0 */24 * * *"
 	defragSchedule := "0 */24 * * *"
 	container := "my-object-storage-container-name"

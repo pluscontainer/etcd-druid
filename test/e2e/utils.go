@@ -62,6 +62,9 @@ const (
 	etcdPrefix             = "etcd"
 
 	etcdCommandMaxRetries = 3
+
+	debugPodName          = "etcd-debug"
+	debugPodContainerName = "etcd-debug"
 )
 
 // Storage contains information about the storage provider.
@@ -241,6 +244,7 @@ func getDefaultEtcd(name, namespace, container, prefix string, provider TestProv
 func getDefaultMultiNodeEtcd(name, namespace, container, prefix string, provider TestProvider) *v1alpha1.Etcd {
 	etcd := getDefaultEtcd(name, namespace, container, prefix, provider)
 	etcd.Spec.Replicas = multiNodeEtcdReplicas
+	etcd.Spec.Etcd.PeerUrlTLS = getPeerTls(provider.Suffix)
 	return etcd
 }
 
@@ -252,6 +256,21 @@ func defaultTls(provider string) v1alpha1.TLSConfig {
 		},
 		ClientTLSSecretRef: corev1.SecretReference{
 			Name:      fmt.Sprintf("%s-%s", "etcd-client-tls", provider),
+			Namespace: namespace,
+		},
+		TLSCASecretRef: v1alpha1.SecretReference{
+			SecretReference: corev1.SecretReference{
+				Name:      fmt.Sprintf("%s-%s", "ca-etcd", provider),
+				Namespace: namespace,
+			},
+		},
+	}
+}
+
+func getPeerTls(provider string) *v1alpha1.TLSConfig {
+	return &v1alpha1.TLSConfig{
+		ServerTLSSecretRef: corev1.SecretReference{
+			Name:      fmt.Sprintf("%s-%s", "etcd-server-cert", provider),
 			Namespace: namespace,
 		},
 		TLSCASecretRef: v1alpha1.SecretReference{
@@ -609,7 +628,7 @@ func purgeSnapstore(store brtypes.SnapStore) error {
 	return nil
 }
 
-func populateEtcdWithCount(logger logr.Logger, kubeconfigPath, namespace, etcdName, podName, containerName, keyPrefix, valuePrefix string, start, end int, delay time.Duration) error {
+func populateEtcd(logger logr.Logger, kubeconfigPath, namespace, etcdName, podName, containerName, keyPrefix, valuePrefix string, startKeyNo, endKeyNo int, delay time.Duration) error {
 	var (
 		cmd     string
 		stdout  string
@@ -617,9 +636,21 @@ func populateEtcdWithCount(logger logr.Logger, kubeconfigPath, namespace, etcdNa
 		retries = 0
 		err     error
 	)
+	install := "echo '" +
+		"ETCD_VERSION=${ETCD_VERSION:-v3.5.6};" +
+		"curl -L https://github.com/coreos/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-amd64.tar.gz -o etcd-$ETCD_VERSION-linux-amd64.tar.gz;" +
+		"tar xzvf etcd-$ETCD_VERSION-linux-amd64.tar.gz; rm etcd-$ETCD_VERSION-linux-amd64.tar.gz;" +
+		"cd etcd-$ETCD_VERSION-linux-amd64; cp etcd /usr/local/bin/; cp etcdctl /usr/local/bin/;" +
+		"rm -rf etcd-$ETCD_VERSION-linux-amd64;'" +
+		" > test.sh && sh test.sh"
 
-	for i := start; i <= end; {
-		cmd = fmt.Sprintf("ETCDCTL_API=3 etcdctl --endpoints=https://%s-local:%d --cacert /var/etcd/ssl/client/ca/ca.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key put %s-%d %s-%d", etcdName, etcdClientPort, keyPrefix, i, valuePrefix, i)
+	stdout, stderr, err = executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, install)
+	if err != nil {
+		logger.Error(err, fmt.Sprintf("Failed to inatall etcdctl. err: %s, stderr: %s, stdout:%s", err, stderr, stdout))
+	}
+
+	for i := startKeyNo; i <= endKeyNo; {
+		cmd = fmt.Sprintf("ETCDCTL_API=3 etcdctl --endpoints=https://%s-client.shoot.svc:%d --cacert /var/etcd/ssl/client/ca/ca.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key put %s-%d %s-%d", etcdName, etcdClientPort, keyPrefix, i, valuePrefix, i)
 		stdout, stderr, err = executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
 		if err != nil || stderr != "" || stdout != "OK" {
 			logger.Error(err, fmt.Sprintf("failed to put (%s-%d, %s-%d): stdout: %s; stderr: %s. Retrying", keyPrefix, i, valuePrefix, i, stdout, stderr))
@@ -629,7 +660,7 @@ func populateEtcdWithCount(logger logr.Logger, kubeconfigPath, namespace, etcdNa
 			}
 			continue
 		}
-		logger.Info(fmt.Sprintf("put (%s-%d, %s-%d) successful", keyPrefix, i, valuePrefix, i))
+		logger.Info("put key-value successful", "key", fmt.Sprintf("%s-%d", keyPrefix, i), "value", fmt.Sprintf("%s-%d", valuePrefix, i))
 		retries = 0
 		i++
 	}
@@ -645,7 +676,7 @@ func getEtcdKey(kubeconfigPath, namespace, etcdName, podName, containerName, key
 		err    error
 	)
 
-	cmd = fmt.Sprintf("ETCDCTL_API=3 etcdctl --endpoints=https://%s-local:%d --cacert /var/etcd/ssl/client/ca/ca.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key get %s-%d", etcdName, etcdClientPort, keyPrefix, suffix)
+	cmd = fmt.Sprintf("ETCDCTL_API=3 etcdctl --endpoints=https://%s-client.shoot.svc:%d --cacert /var/etcd/ssl/client/ca/ca.crt --cert=/var/etcd/ssl/client/client/tls.crt --key=/var/etcd/ssl/client/client/tls.key get %s-%d", etcdName, etcdClientPort, keyPrefix, suffix)
 	stdout, stderr, err = executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
 	if err != nil || stderr != "" {
 		return "", "", fmt.Errorf("failed to get %s-%d: stdout: %s; stderr: %s; err: %v", keyPrefix, suffix, stdout, stderr, err)
@@ -669,7 +700,7 @@ func getEtcdKeys(logger logr.Logger, kubeconfigPath, namespace, etcdName, podNam
 	for i := start; i <= end; {
 		key, val, err = getEtcdKey(kubeconfigPath, namespace, etcdName, podName, containerName, keyPrefix, i)
 		if err != nil {
-			logger.Info(fmt.Sprintf("failed to get key %s-%d. Retrying", keyPrefix, i))
+			logger.Info("failed to get key. Retrying...", "key", fmt.Sprintf("%s-%d", keyPrefix, i))
 			retries++
 			if retries >= etcdCommandMaxRetries {
 				return nil, fmt.Errorf("failed to get key %s-%d", keyPrefix, i)
@@ -677,7 +708,7 @@ func getEtcdKeys(logger logr.Logger, kubeconfigPath, namespace, etcdName, podNam
 			continue
 		}
 		retries = 0
-		logger.Info(fmt.Sprintf("fetched (%s, %s) from etcd", key, val))
+		logger.Info("fetched key-value pair from etcd", "key", key, "value", val)
 		keyValueMap[key] = val
 		i++
 	}
@@ -685,7 +716,7 @@ func getEtcdKeys(logger logr.Logger, kubeconfigPath, namespace, etcdName, podNam
 	return keyValueMap, nil
 }
 
-func triggerOnDemandSnapshot(kubeconfigPath, namespace, podName, containerName string, port int, snapshotKind string) (*brtypes.Snapshot, error) {
+func triggerOnDemandSnapshot(kubeconfigPath, namespace, etcdName, podName, containerName string, port int, snapshotKind string) (*brtypes.Snapshot, error) {
 	var (
 		snapshot *brtypes.Snapshot
 		snapKind string
@@ -699,7 +730,7 @@ func triggerOnDemandSnapshot(kubeconfigPath, namespace, podName, containerName s
 	default:
 		return nil, fmt.Errorf("invalid snapshotKind %s", snapshotKind)
 	}
-	cmd := fmt.Sprintf("curl https://localhost:%d/snapshot/%s -k -s", port, snapKind)
+	cmd := fmt.Sprintf("curl https://%s-client.shoot.svc:%d/snapshot/%s -k -s", etcdName, port, snapKind)
 	stdout, stderr, err := executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
 	if err != nil || stdout == "" {
 		return nil, fmt.Errorf("failed to trigger on-demand %s snapshot for %s: stdout: %s; stderr: %s; err: %v", snapKind, podName, stdout, stderr, err)
@@ -713,7 +744,7 @@ func triggerOnDemandSnapshot(kubeconfigPath, namespace, podName, containerName s
 
 func getLatestSnapshots(kubeconfigPath, namespace, etcdName, podName, containerName string, port int) (*LatestSnapshots, error) {
 	var latestSnapshots *LatestSnapshots
-	cmd := fmt.Sprintf("curl https://%s-local:%d/snapshot/latest -k -s", etcdName, port)
+	cmd := fmt.Sprintf("curl https://%s-client.shoot.svc:%d/snapshot/latest -k -s", etcdName, port)
 	stdout, stderr, err := executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
 	if err != nil || stdout == "" {
 		return nil, fmt.Errorf("failed to fetch latest snapshots taken for %s: stdout: %s; stderr: %s; err: %v", podName, stdout, stderr, err)
@@ -735,15 +766,6 @@ func deleteDir(kubeconfigPath, namespace, podName, containerName string, dirPath
 	stdout, stderr, err := executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
 	if err != nil || stdout != "" {
 		return fmt.Errorf("failed to delete directory %s for %s: stdout: %s; stderr: %s; err: %v", dirPath, podName, stdout, stderr, err)
-	}
-	return nil
-}
-
-func corruptDBFile(kubeconfigPath, namespace, podName, containerName string, dirPath string) error {
-	cmd := fmt.Sprintf("echo destrory > %s", dirPath)
-	stdout, stderr, err := executeRemoteCommand(kubeconfigPath, namespace, podName, containerName, cmd)
-	if err != nil || stdout != "" {
-		return fmt.Errorf("failed to corrupt db %s for %s: stdout: %s; stderr: %s; err: %v", dirPath, podName, stdout, stderr, err)
 	}
 	return nil
 }
@@ -818,7 +840,7 @@ func etcdZeroDownTimeValidatorJob(etcdSvc, testName string, tls *v1alpha1.TLSCon
 							"failed=0 ; threshold=2 ; " +
 							"while [ $failed -lt $threshold ] ; do  " +
 							"$(curl --cacert /var/etcd/ssl/client/ca/ca.crt --cert /var/etcd/ssl/client/client/tls.crt --key /var/etcd/ssl/client/client/tls.key https://" + etcdSvc + ":2379/health -s -f  -o /dev/null ); " +
-							"if [ $? -gt 0 ] ; then let failed++; echo \"etcd is unhealthy and retrying\"; continue;  fi ; " +
+							"if [ $? -gt 0 ] ; then let failed++; echo \"etcd is unhealthy and retrying\"; sleep 1; continue;  fi ; " +
 							"echo \"etcd is healthy\";  touch /tmp/healthy; let failed=0; " +
 							"sleep 1; done;  echo \"etcd is unhealthy\"; exit 1;" +
 							"' > test.sh && sh test.sh",
@@ -869,4 +891,85 @@ func etcdZeroDownTimeValidatorJob(etcdSvc, testName string, tls *v1alpha1.TLSCon
 			},
 			RestartPolicy: v1.RestartPolicyNever,
 		})
+}
+
+func getDebugPod(etcd *v1alpha1.Etcd) *corev1.Pod {
+	volumeName := etcd.Name
+	if etcd.Spec.VolumeClaimTemplate != nil && len(*etcd.Spec.VolumeClaimTemplate) != 0 {
+		volumeName = *etcd.Spec.VolumeClaimTemplate
+	}
+
+	pvcName := volumeName + "-" + etcd.Name + "-0"
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      debugPodName,
+			Namespace: namespace,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  debugPodContainerName,
+					Image: "nginx",
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							MountPath: "/var/etcd/ssl/client/ca",
+							Name:      "client-url-ca-etcd",
+						},
+						{
+							MountPath: "/var/etcd/ssl/client/server",
+							Name:      "client-url-etcd-server-tls",
+						},
+						{
+							MountPath: "/var/etcd/ssl/client/client",
+							Name:      "client-url-etcd-client-tls",
+							ReadOnly:  true,
+						},
+						{
+							MountPath: "/var/etcd/data",
+							Name:      volumeName,
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "client-url-ca-etcd",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  etcd.Spec.Etcd.ClientUrlTLS.TLSCASecretRef.Name,
+							DefaultMode: pointer.Int32(420),
+						},
+					},
+				},
+				{
+					Name: "client-url-etcd-server-tls",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  etcd.Spec.Etcd.ClientUrlTLS.ClientTLSSecretRef.Name,
+							DefaultMode: pointer.Int32(420),
+						},
+					},
+				},
+				{
+					Name: "client-url-etcd-client-tls",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName:  etcd.Spec.Etcd.ClientUrlTLS.ServerTLSSecretRef.Name,
+							DefaultMode: pointer.Int32(420),
+						},
+					},
+				},
+				{
+					Name: volumeName,
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
 }

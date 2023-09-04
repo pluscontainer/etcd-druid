@@ -19,7 +19,7 @@ import (
 
 	"github.com/gardener/gardener/pkg/controllerutils"
 
-	gardenercomponent "github.com/gardener/gardener/pkg/operation/botanist/component"
+	gardenercomponent "github.com/gardener/gardener/pkg/component"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
@@ -37,7 +37,7 @@ func (c component) Deploy(ctx context.Context) error {
 		serviceAccount.Name = c.values.Name
 		serviceAccount.Namespace = c.values.Namespace
 		serviceAccount.Labels = c.values.Labels
-		serviceAccount.OwnerReferences = c.values.OwnerReferences
+		serviceAccount.OwnerReferences = []metav1.OwnerReference{c.values.OwnerReference}
 		serviceAccount.AutomountServiceAccountToken = pointer.Bool(!c.values.DisableAutomount)
 		return nil
 	})

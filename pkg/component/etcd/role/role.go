@@ -19,7 +19,7 @@ import (
 
 	"github.com/gardener/gardener/pkg/controllerutils"
 
-	gardenercomponent "github.com/gardener/gardener/pkg/operation/botanist/component"
+	gardenercomponent "github.com/gardener/gardener/pkg/component"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,7 +36,7 @@ func (c component) Deploy(ctx context.Context) error {
 		role.Name = c.values.Name
 		role.Namespace = c.values.Namespace
 		role.Labels = c.values.Labels
-		role.OwnerReferences = c.values.OwnerReferences
+		role.OwnerReferences = []metav1.OwnerReference{c.values.OwnerReference}
 		role.Rules = c.values.Rules
 		return nil
 	})

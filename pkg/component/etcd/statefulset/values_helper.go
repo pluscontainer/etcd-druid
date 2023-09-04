@@ -28,6 +28,7 @@ const (
 	defaultBackupPort              int32 = 8080
 	defaultServerPort              int32 = 2380
 	defaultClientPort              int32 = 2379
+	defaultWrapperPort             int32 = 9095
 	defaultQuota                   int64 = 8 * 1024 * 1024 * 1024 // 8Gi
 	defaultSnapshotMemoryLimit     int64 = 100 * 1024 * 1024      // 100Mi
 	defaultHeartbeatDuration             = "10s"
@@ -47,7 +48,7 @@ func GenerateValues(
 	clientPort, serverPort, backupPort *int32,
 	etcdImage, backupImage string,
 	checksumAnnotations map[string]string,
-	peerTLSChangedToEnabled bool) Values {
+	peerTLSChangedToEnabled, useEtcdWrapper bool) Values {
 
 	volumeClaimTemplateName := etcd.Name
 	if etcd.Spec.VolumeClaimTemplate != nil && len(*etcd.Spec.VolumeClaimTemplate) != 0 {
@@ -57,11 +58,12 @@ func GenerateValues(
 	values := Values{
 		Name:                      etcd.Name,
 		Namespace:                 etcd.Namespace,
-		EtcdUID:                   etcd.UID,
+		OwnerReference:            etcd.GetAsOwnerReference(),
 		Replicas:                  etcd.Spec.Replicas,
 		StatusReplicas:            etcd.Status.Replicas,
 		Annotations:               utils.MergeStringMaps(checksumAnnotations, etcd.Spec.Annotations),
-		Labels:                    etcd.Spec.Labels,
+		Labels:                    etcd.GetDefaultLabels(),
+		AdditionalPodLabels:       etcd.Spec.Labels,
 		EtcdImage:                 etcdImage,
 		BackupImage:               backupImage,
 		PriorityClassName:         etcd.Spec.PriorityClassName,
@@ -111,14 +113,17 @@ func GenerateValues(
 		PeerServiceName:   etcd.GetPeerServiceName(),
 		ServerPort:        serverPort,
 		BackupPort:        backupPort,
+		WrapperPort:       pointer.Int32(defaultWrapperPort),
 
 		AutoCompactionMode:      etcd.Spec.Common.AutoCompactionMode,
 		AutoCompactionRetention: etcd.Spec.Common.AutoCompactionRetention,
 		ConfigMapName:           etcd.GetConfigmapName(),
 		PeerTLSChangedToEnabled: peerTLSChangedToEnabled,
+
+		UseEtcdWrapper: useEtcdWrapper,
 	}
 
-	values.EtcdCommand = getEtcdCommand()
+	values.EtcdCommand = getEtcdCommand(values)
 
 	// Use linearizability for readiness probe so that pod is only considered ready
 	// when it has an active connection to the cluster and the cluster maintains a quorum.
@@ -129,8 +134,30 @@ func GenerateValues(
 	return values
 }
 
-func getEtcdCommand() []string {
-	return []string{"/var/etcd/bin/bootstrap.sh"}
+func getEtcdCommand(val Values) []string {
+	if !val.UseEtcdWrapper {
+		// safe to return an empty string array here since etcd-custom-image:v3.4.13-bootstrap-12 now uses an entry point that calls bootstrap.sh
+		return []string{}
+	}
+	//TODO @aaronfern: remove this feature gate when UseEtcdWraper becomes GA
+	command := []string{"" + "start-etcd"}
+	command = append(command, fmt.Sprintf("--backup-restore-host-port=%s-local:8080", val.Name))
+	command = append(command, fmt.Sprintf("--etcd-server-name=%s-local", val.Name))
+
+	if val.ClientUrlTLS == nil {
+		command = append(command, "--backup-restore-tls-enabled=false")
+	} else {
+		dataKey := "ca.crt"
+		if val.ClientUrlTLS.TLSCASecretRef.DataKey != nil {
+			dataKey = *val.ClientUrlTLS.TLSCASecretRef.DataKey
+		}
+		command = append(command, "--backup-restore-tls-enabled=true")
+		command = append(command, "--etcd-client-cert-path=/var/etcd/ssl/client/client/tls.crt")
+		command = append(command, "--etcd-client-key-path=/var/etcd/ssl/client/client/tls.key")
+		command = append(command, fmt.Sprintf("--backup-restore-ca-cert-bundle-path=/var/etcd/ssl/client/ca/%s", dataKey))
+	}
+
+	return command
 }
 
 type consistencyLevel string
@@ -177,8 +204,7 @@ func getProbeCommand(val Values, consistency consistencyLevel) []string {
 }
 
 func getBackupRestoreCommand(val Values) []string {
-	command := []string{"" + "etcdbrctl"}
-	command = append(command, "server")
+	command := []string{"server"}
 
 	if val.BackupStore != nil {
 		command = append(command, "--enable-snapshot-lease-renewal=true")
@@ -205,7 +231,7 @@ func getBackupRestoreCommand(val Values) []string {
 	}
 
 	command = append(command, "--data-dir=/var/etcd/data/new.etcd")
-	command = append(command, "--restoration-temp-snapshots-dir=/var/etcd/restoration.temp")
+	command = append(command, "--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp")
 
 	if val.BackupStore != nil {
 		store, _ := utils.StorageProviderFromInfraProvider(val.BackupStore.Provider)

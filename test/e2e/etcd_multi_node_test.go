@@ -86,10 +86,10 @@ var _ = Describe("Etcd", func() {
 			By("Create etcd")
 			createAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
 
-			By("Hibernate etcd (Scale down from 3->0)")
+			By("Hibernate etcd (Scale down from 3 replicas to 0)")
 			hibernateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
 
-			By("Wakeup etcd (Scale up from 0->3)")
+			By("Wakeup etcd (Scale up from 0->3 replicas)")
 			// scale up etcd replicas to 3 and ensures etcd cluster with 3 replicas is ready.
 			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
 			etcd.Spec.Replicas = multiNodeEtcdReplicas
@@ -122,13 +122,18 @@ var _ = Describe("Etcd", func() {
 
 			By("Member restart with data-dir/pvc intact")
 			objLogger.Info("Delete one member pod")
-			deletePod(ctx, cl, objLogger, etcd, "etcd-aws-2")
+			deletePod(ctx, cl, objLogger, etcd, fmt.Sprintf("%s-2", etcdName))
 			checkEtcdReady(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
 
 			By("Single member restoration")
+			objLogger.Info("Create debug pod")
+			debugPod := createDebugPod(ctx, etcd)
 			objLogger.Info("Delete member dir of one member pod")
-			deleteMemberDir(ctx, cl, objLogger, etcd, "etcd-aws-2")
+			deleteMemberDir(ctx, cl, objLogger, etcd, debugPod.Name, debugPod.Spec.Containers[0].Name)
 			checkEtcdReady(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+
+			By("Delete debug pod")
+			Expect(cl.Delete(ctx, debugPod)).ToNot(HaveOccurred())
 
 			By("Delete etcd")
 			deleteAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
@@ -136,7 +141,7 @@ var _ = Describe("Etcd", func() {
 	})
 
 	Context("when a single-node is configured", func() {
-		It("should scale a single-node etcd to a multi-node etcd cluster", func() {
+		It("should scale a single-node etcd (TLS not enabled for peerUrl) to a multi-node etcd cluster (TLS not enabled for peerUrl)", func() {
 			ctx, cancelFunc := context.WithTimeout(parentCtx, 10*time.Minute)
 			defer cancelFunc()
 
@@ -146,9 +151,29 @@ var _ = Describe("Etcd", func() {
 			By("Creating a single-node etcd")
 			createAndCheckEtcd(ctx, cl, objLogger, etcd, singleNodeEtcdTimeout)
 
-			By("Scaling up a healthy cluster (from 1 to 3)")
+			By("Scaling up a healthy cluster (from 1 to 3 replicas)")
 			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
 			etcd.Spec.Replicas = 3
+			updateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+
+			By("Deleting etcd")
+			deleteAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+		})
+
+		It("should scale a single-node etcd (TLS not enabled for peerUrl) to a multi-node etcd cluster (TLS enabled for peerUrl)", func() {
+			ctx, cancelFunc := context.WithTimeout(parentCtx, 10*time.Minute)
+			defer cancelFunc()
+
+			etcd := getDefaultEtcd(etcdName, namespace, storageContainer, storePrefix, provider)
+			objLogger := logger.WithValues("etcd-multi-node", client.ObjectKeyFromObject(etcd))
+
+			By("Creating a single-node etcd")
+			createAndCheckEtcd(ctx, cl, objLogger, etcd, singleNodeEtcdTimeout)
+
+			By("Scaling up a healthy cluster (from 1 to 3 replicas) with TLS enabled for peerUrl")
+			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
+			etcd.Spec.Replicas = 3
+			etcd.Spec.Etcd.PeerUrlTLS = getPeerTls(provider.Suffix)
 			updateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
 
 			By("Deleting the single-node etcd")
@@ -183,11 +208,41 @@ var _ = Describe("Etcd", func() {
 			By("Deleting the single-node etcd")
 			deleteAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
 		})
+
+		It("should scale down a single-node etcd to 0 replica, then scale up from 0->1 replica and then from 1->3 replicas with TLS enabled for cluster peerUrl", func() {
+			ctx, cancelFunc := context.WithTimeout(parentCtx, 10*time.Minute)
+			defer cancelFunc()
+
+			etcd := getDefaultEtcd(etcdName, namespace, storageContainer, storePrefix, provider)
+			objLogger := logger.WithValues("etcd-multi-node", client.ObjectKeyFromObject(etcd))
+
+			By("Creating a single-node etcd")
+			createAndCheckEtcd(ctx, cl, objLogger, etcd, singleNodeEtcdTimeout)
+
+			By("Scaling down a healthy cluster (from 1 to 0 replica)")
+			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
+			etcd.Spec.Replicas = 0
+			updateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+
+			By("Scaling up cluster (from 0 to 1 replica)")
+			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
+			etcd.Spec.Replicas = 1
+			updateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+
+			By("Scaling up a healthy cluster (from 1 to 3 replica) with TLS enabled for peerUrl")
+			Expect(cl.Get(ctx, client.ObjectKeyFromObject(etcd), etcd)).To(Succeed())
+			etcd.Spec.Replicas = 3
+			etcd.Spec.Etcd.PeerUrlTLS = getPeerTls(provider.Suffix)
+			updateAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+
+			By("Deleting the single-node etcd")
+			deleteAndCheckEtcd(ctx, cl, objLogger, etcd, multiNodeEtcdTimeout)
+		})
 	})
 })
 
-func deleteMemberDir(ctx context.Context, cl client.Client, logger logr.Logger, etcd *v1alpha1.Etcd, podName string) {
-	ExpectWithOffset(1, deleteDir(kubeconfigPath, namespace, podName, "backup-restore", "/var/etcd/data/new.etcd/member")).To(Succeed())
+func deleteMemberDir(ctx context.Context, cl client.Client, logger logr.Logger, etcd *v1alpha1.Etcd, podName, containerName string) {
+	ExpectWithOffset(1, deleteDir(kubeconfigPath, namespace, podName, containerName, "/var/etcd/data/new.etcd/member")).To(Succeed())
 	checkUnreadySts(ctx, cl, logger, etcd)
 }
 
@@ -206,7 +261,7 @@ func checkUnreadySts(ctx context.Context, cl client.Client, logger logr.Logger, 
 			return err
 		}
 		if sts.Status.ReadyReplicas == *sts.Spec.Replicas {
-			return fmt.Errorf("sts %s is still in ready state", "etcd-aws")
+			return fmt.Errorf("sts %s is still in ready state", sts.Name)
 		}
 		return nil
 	}, multiNodeEtcdTimeout, pollingInterval).Should(BeNil())
@@ -384,18 +439,18 @@ func checkJobReady(ctx context.Context, cl client.Client, jobName string) {
 }
 
 // etcdZeroDownTimeValidatorJob returns k8s job which ensures
-// Etcd cluster zero down time by continuously checking etcd cluster health.
+// Etcd cluster zero downtime by continuously checking etcd cluster health.
 // This job fails once health check fails and associated pod results in error status.
 func startEtcdZeroDownTimeValidatorJob(ctx context.Context, cl client.Client,
 	etcd *v1alpha1.Etcd, testName string) *batchv1.Job {
 	job := etcdZeroDownTimeValidatorJob(etcd.Name+"-client", testName, etcd.Spec.Etcd.ClientUrlTLS)
 
-	logger.Info(fmt.Sprintf("Creating job %s to ensure etcd zero downtime", job.Name))
+	logger.Info("Creating job to ensure etcd zero downtime", "job", job.Name)
 	ExpectWithOffset(1, cl.Create(ctx, job)).ShouldNot(HaveOccurred())
 
 	// Wait until zeroDownTimeValidator job is up and running.
 	checkJobReady(ctx, cl, job.Name)
-	logger.Info(fmt.Sprintf("Job %s is ready", job.Name))
+	logger.Info("Job is ready", "job", job.Name)
 	return job
 }
 

@@ -15,15 +15,16 @@
 package main
 
 import (
-	"flag"
-	"fmt"
 	"os"
+	"runtime"
 
+	"github.com/go-logr/logr"
 	"go.uber.org/zap/zapcore"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/gardener/etcd-druid/controllers"
-	"github.com/go-logr/logr"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"github.com/gardener/etcd-druid/pkg/version"
+	flag "github.com/spf13/pflag"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,10 +38,16 @@ func main() {
 
 	ctrl.SetLogger(zap.New(buildDefaultLoggerOpts()...))
 
+	printVersionInfo()
+
 	mgrConfig := controllers.ManagerConfig{}
-	controllers.InitFromFlags(flag.CommandLine, &mgrConfig)
+	if err := mgrConfig.InitFromFlags(flag.CommandLine); err != nil {
+		logger.Error(err, "failed to initialize from flags")
+		os.Exit(1)
+	}
 
 	flag.Parse()
+
 	printFlags(logger)
 
 	if err := mgrConfig.Validate(); err != nil {
@@ -63,13 +70,18 @@ func main() {
 	}
 }
 
+func printVersionInfo() {
+	logger.Info("Etcd-druid build information", "Etcd-druid Version", version.Version, "Git SHA", version.GitSHA)
+	logger.Info("Golang runtime information", "Version", runtime.Version(), "OS", runtime.GOOS, "Arch", runtime.GOARCH)
+}
+
 func printFlags(logger logr.Logger) {
-	var flagsToPrint string
+	var flagKVs []interface{}
 	flag.VisitAll(func(f *flag.Flag) {
-		flagsToPrint += fmt.Sprintf("%s: %s, ", f.Name, f.Value)
+		flagKVs = append(flagKVs, f.Name, f.Value.String())
 	})
 
-	logger.Info(fmt.Sprintf("Running with flags: %s", flagsToPrint[:len(flagsToPrint)-2]))
+	logger.Info("Running with flags", flagKVs...)
 }
 
 func buildDefaultLoggerOpts() []zap.Opts {

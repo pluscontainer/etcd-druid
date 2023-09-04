@@ -15,10 +15,17 @@
 package etcdcopybackupstask
 
 import (
-	"flag"
-
 	"github.com/gardener/etcd-druid/controllers/utils"
+	"github.com/gardener/etcd-druid/pkg/features"
+
+	flag "github.com/spf13/pflag"
+	"k8s.io/component-base/featuregate"
 )
+
+// featureList holds the feature gate names that are relevant for the EtcdCopyBackupTask Controller.
+var featureList = []featuregate.Feature{
+	features.UseEtcdWrapper,
+}
 
 const (
 	workersFlagName = "etcd-copy-backups-task-workers"
@@ -30,6 +37,8 @@ const (
 type Config struct {
 	// Workers is the number of workers concurrently processing reconciliation requests.
 	Workers int
+	// FeatureGates contains the feature gates to be used by EtcdCopyBackupTask Controller.
+	FeatureGates map[featuregate.Feature]bool
 }
 
 // InitFromFlags initializes the config from the provided CLI flag set.
@@ -40,8 +49,15 @@ func InitFromFlags(fs *flag.FlagSet, cfg *Config) {
 
 // Validate validates the config.
 func (cfg *Config) Validate() error {
-	if err := utils.MustBeGreaterThanOrEqualTo(workersFlagName, 0, cfg.Workers); err != nil {
-		return err
+	return utils.MustBeGreaterThanOrEqualTo(workersFlagName, 0, cfg.Workers)
+}
+
+// CaptureFeatureActivations captures all feature gates required by the controller into controller config
+func (cfg *Config) CaptureFeatureActivations(fg featuregate.FeatureGate) {
+	if cfg.FeatureGates == nil {
+		cfg.FeatureGates = make(map[featuregate.Feature]bool)
 	}
-	return nil
+	for _, feature := range featureList {
+		cfg.FeatureGates[feature] = fg.Enabled(feature)
+	}
 }

@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
-	"github.com/gardener/etcd-druid/controllers/utils"
+	ctrlutils "github.com/gardener/etcd-druid/controllers/utils"
 	"github.com/gardener/etcd-druid/pkg/common"
 	componentconfigmap "github.com/gardener/etcd-druid/pkg/component/etcd/configmap"
 	componentlease "github.com/gardener/etcd-druid/pkg/component/etcd/lease"
@@ -30,11 +30,12 @@ import (
 	componentservice "github.com/gardener/etcd-druid/pkg/component/etcd/service"
 	componentserviceaccount "github.com/gardener/etcd-druid/pkg/component/etcd/serviceaccount"
 	componentsts "github.com/gardener/etcd-druid/pkg/component/etcd/statefulset"
+	"github.com/gardener/etcd-druid/pkg/features"
 	druidutils "github.com/gardener/etcd-druid/pkg/utils"
 
 	v1beta1constants "github.com/gardener/gardener/pkg/apis/core/v1beta1/constants"
+	gardenercomponent "github.com/gardener/gardener/pkg/component"
 	"github.com/gardener/gardener/pkg/controllerutils"
-	gardenercomponent "github.com/gardener/gardener/pkg/operation/botanist/component"
 	"github.com/gardener/gardener/pkg/utils/imagevector"
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	"github.com/go-logr/logr"
@@ -76,7 +77,7 @@ type Reconciler struct {
 
 // NewReconciler creates a new reconciler for Etcd.
 func NewReconciler(mgr manager.Manager, config *Config) (*Reconciler, error) {
-	imageVector, err := utils.CreateImageVector()
+	imageVector, err := ctrlutils.CreateImageVector()
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +165,7 @@ func (r *Reconciler) reconcile(ctx context.Context, etcd *druidv1alpha1.Etcd) (c
 
 	// Add Finalizers to Etcd
 	if finalizers := sets.NewString(etcd.Finalizers...); !finalizers.Has(common.FinalizerName) {
-		logger.Info("Adding finalizer")
+		logger.Info("Adding finalizer", "namespace", etcd.Namespace, "name", etcd.Name, "finalizerName", common.FinalizerName)
 		if err := controllerutils.AddFinalizers(ctx, r.Client, etcd, common.FinalizerName); err != nil {
 			if err := r.updateEtcdErrorStatus(ctx, etcd, reconcileResult{err: err}); err != nil {
 				return ctrl.Result{
@@ -221,9 +222,9 @@ func (r *Reconciler) reconcile(ctx context.Context, etcd *druidv1alpha1.Etcd) (c
 
 func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl.Result, error) {
 	logger := r.logger.WithValues("etcd", kutil.Key(etcd.Namespace, etcd.Name).String(), "operation", "delete")
-	logger.Info("Starting operation")
+	logger.Info("Starting deletion operation", "namespace", etcd.Namespace, "name", etcd.Name)
 
-	stsDeployer := gardenercomponent.OpDestroyAndWait(componentsts.New(r.Client, logger, componentsts.Values{Name: etcd.Name, Namespace: etcd.Namespace}))
+	stsDeployer := gardenercomponent.OpDestroyAndWait(componentsts.New(r.Client, logger, componentsts.Values{Name: etcd.Name, Namespace: etcd.Namespace}, r.config.FeatureGates))
 	if err := stsDeployer.Destroy(ctx); err != nil {
 		if err = r.updateEtcdErrorStatus(ctx, etcd, reconcileResult{err: err}); err != nil {
 			return ctrl.Result{
@@ -288,14 +289,14 @@ func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl
 	}
 
 	if sets.NewString(etcd.Finalizers...).Has(common.FinalizerName) {
-		logger.Info("Removing finalizer")
+		logger.Info("Removing finalizer", "namespace", etcd.Namespace, "name", etcd.Name, "finalizerName", common.FinalizerName)
 		if err := controllerutils.RemoveFinalizers(ctx, r.Client, etcd, common.FinalizerName); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{
 				Requeue: true,
 			}, err
 		}
 	}
-	logger.Info("Deleted etcd successfully.")
+	logger.Info("Deleted etcd successfully", "namespace", etcd.Namespace, "name", etcd.Name)
 	return ctrl.Result{}, nil
 }
 
@@ -306,7 +307,7 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 		return reconcileResult{err: fmt.Errorf("Spec.Replicas should not be even number: %d", etcd.Spec.Replicas)}
 	}
 
-	etcdImage, etcdBackupImage, err := druidutils.GetEtcdImages(etcd, r.imageVector)
+	etcdImage, etcdBackupImage, err := druidutils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
 	if err != nil {
 		return reconcileResult{err: err}
 	}
@@ -367,19 +368,22 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 	}
 
 	peerUrlTLSChangedToEnabled := isPeerTLSChangedToEnabled(peerTLSEnabled, configMapValues)
-	statefulSetValues := componentsts.GenerateValues(etcd,
+	statefulSetValues := componentsts.GenerateValues(
+		etcd,
 		&serviceValues.ClientPort,
-		&serviceValues.ServerPort,
+		&serviceValues.PeerPort,
 		&serviceValues.BackupPort,
 		*etcdImage,
 		*etcdBackupImage,
 		map[string]string{
 			"checksum/etcd-configmap": configMapValues.ConfigMapChecksum,
-		}, peerUrlTLSChangedToEnabled)
+		}, peerUrlTLSChangedToEnabled,
+		r.config.FeatureGates[features.UseEtcdWrapper],
+	)
 
 	// Create an OpWaiter because after the deployment we want to wait until the StatefulSet is ready.
 	var (
-		stsDeployer  = componentsts.New(r.Client, logger, statefulSetValues)
+		stsDeployer  = componentsts.New(r.Client, logger, statefulSetValues, r.config.FeatureGates)
 		deployWaiter = gardenercomponent.OpWait(stsDeployer)
 	)
 
@@ -398,25 +402,11 @@ func isPeerTLSChangedToEnabled(peerTLSEnabledStatusFromMembers bool, configMapVa
 	return configMapValues.PeerUrlTLS != nil
 }
 
-func bootstrapReset(etcd *druidv1alpha1.Etcd) {
-	etcd.Status.Members = nil
-	etcd.Status.ClusterSize = pointer.Int32(etcd.Spec.Replicas)
-}
-
-func clusterInBootstrap(etcd *druidv1alpha1.Etcd) bool {
-	return etcd.Status.Replicas == 0 ||
-		(etcd.Spec.Replicas > 1 && etcd.Status.Replicas == 1)
-}
-
 func (r *Reconciler) updateEtcdErrorStatus(ctx context.Context, etcd *druidv1alpha1.Etcd, result reconcileResult) error {
-	lastErrStr := fmt.Sprintf("%v", result.err)
+	lastErrStr := result.err.Error()
 	etcd.Status.LastError = &lastErrStr
 	etcd.Status.ObservedGeneration = &etcd.Generation
 	if result.sts != nil {
-		if clusterInBootstrap(etcd) {
-			// Reset members in bootstrap phase to ensure dependent conditions can be calculated correctly.
-			bootstrapReset(etcd)
-		}
 		ready, _ := druidutils.IsStatefulSetReady(etcd.Spec.Replicas, result.sts)
 		etcd.Status.Ready = &ready
 		etcd.Status.Replicas = pointer.Int32Deref(result.sts.Spec.Replicas, 0)
@@ -426,10 +416,6 @@ func (r *Reconciler) updateEtcdErrorStatus(ctx context.Context, etcd *druidv1alp
 }
 
 func (r *Reconciler) updateEtcdStatus(ctx context.Context, etcd *druidv1alpha1.Etcd, result reconcileResult) error {
-	if clusterInBootstrap(etcd) {
-		// Reset members in bootstrap phase to ensure dependent conditions can be calculated correctly.
-		bootstrapReset(etcd)
-	}
 	if result.sts != nil {
 		ready, _ := druidutils.IsStatefulSetReady(etcd.Spec.Replicas, result.sts)
 		etcd.Status.Ready = &ready
@@ -444,7 +430,7 @@ func (r *Reconciler) updateEtcdStatus(ctx context.Context, etcd *druidv1alpha1.E
 
 func (r *Reconciler) removeOperationAnnotation(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) error {
 	if _, ok := etcd.Annotations[v1beta1constants.GardenerOperation]; ok {
-		logger.Info("Removing operation annotation")
+		logger.Info("Removing operation annotation", "namespace", etcd.Namespace, "name", etcd.Name, "annotation", v1beta1constants.GardenerOperation)
 		withOpAnnotation := etcd.DeepCopy()
 		delete(etcd.Annotations, v1beta1constants.GardenerOperation)
 		return r.Patch(ctx, etcd, client.MergeFrom(withOpAnnotation))
