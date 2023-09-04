@@ -428,25 +428,6 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 					ServiceAccountName:        c.values.ServiceAccountName,
 					Affinity:                  c.values.Affinity,
 					TopologySpreadConstraints: c.values.TopologySpreadConstraints,
-					InitContainers: []corev1.Container{
-						{
-							Name:         "change-permissions",
-							Image:        "alpine:3.18.0",
-							Command:      []string{"sh", "-c", "--"},
-							Args:         []string{"chown -R 65532:65532 /var/etcd/data"},
-							VolumeMounts: getEtcdVolumeMounts(c.values),
-							SecurityContext: &corev1.SecurityContext{
-								RunAsGroup:   pointer.Int64(0),
-								RunAsNonRoot: pointer.Bool(false),
-								RunAsUser:    pointer.Int64(0),
-							},
-						},
-					},
-					SecurityContext: &corev1.PodSecurityContext{
-						RunAsGroup:   pointer.Int64(65532),
-						RunAsNonRoot: pointer.Bool(true),
-						RunAsUser:    pointer.Int64(65532),
-					},
 					Containers: []corev1.Container{
 						{
 							Name:            "etcd",
