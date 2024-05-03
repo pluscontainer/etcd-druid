@@ -72,7 +72,7 @@ install: manifests
 	kubectl apply -f config/crd/bases
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-.PHONY: deploy
+.PHONY: deploy-via-kustomize
 deploy-via-kustomize: manifests $(KUSTOMIZE)
 	kubectl apply -f config/crd/bases
 	kustomize build config/default | kubectl apply -f -
@@ -80,8 +80,8 @@ deploy-via-kustomize: manifests $(KUSTOMIZE)
 # Deploy controller to the Kubernetes cluster specified in the environment variable KUBECONFIG
 # Modify the Helm template located at charts/druid/templates if any changes are required
 .PHONY: deploy
-deploy: $(SKAFFOLD) 
-	$(SKAFFOLD) run -m etcd-druid
+deploy: $(SKAFFOLD) $(HELM)
+	$(SKAFFOLD) run -m etcd-druid --kubeconfig=$(KUBECONFIG_PATH)
 
 # Generate manifests e.g. CRD, RBAC etc.
 .PHONY: manifests
@@ -155,7 +155,7 @@ update-dependencies:
 .PHONY: add-license-headers
 add-license-headers: $(GO_ADD_LICENSE)
 	@./hack/addlicenseheaders.sh ${YEAR}
-	
+
 .PHONY: kind-up
 kind-up: $(KIND)
 	@printf "\n\033[0;33m📌 NOTE: To target the newly created KinD cluster, please run the following command:\n\n    export KUBECONFIG=$(KUBECONFIG_PATH)\n\033[0m\n"
@@ -167,7 +167,7 @@ kind-down: $(KIND)
 
 .PHONY: deploy-localstack
 deploy-localstack: $(KUBECTL)
-	BUCKET_NAME=$(BUCKET_NAME) ./hack/deploy-localstack.sh
+	./hack/deploy-localstack.sh
 
 .PHONY: ci-e2e-kind
 ci-e2e-kind:

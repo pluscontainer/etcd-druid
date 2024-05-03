@@ -40,8 +40,8 @@ var (
 	clientPort              int32 = 2379
 	serverPort              int32 = 2380
 	backupPort              int32 = 8080
-	imageEtcd                     = "eu.gcr.io/gardener-project/gardener/etcd-wrapper:v0.1.0"
-	imageBR                       = "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.25.0"
+	imageEtcd                     = "europe-docker.pkg.dev/gardener-project/public/gardener/etcd-wrapper:v0.1.0"
+	imageBR                       = "europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl:v0.25.0"
 	snapshotSchedule              = "0 */24 * * *"
 	defragSchedule                = "0 */24 * * *"
 	container                     = "default.bkp"
@@ -166,6 +166,8 @@ func (eb *EtcdBuilder) WithStorageProvider(provider druidv1alpha1.StorageProvide
 		return eb.WithProviderGCS()
 	case "openstack":
 		return eb.WithProviderSwift()
+	case "local":
+		return eb.WithProviderLocal()
 	default:
 		return eb
 	}
@@ -222,6 +224,16 @@ func (eb *EtcdBuilder) WithProviderOSS() *EtcdBuilder {
 	eb.etcd.Spec.Backup.Store = getBackupStore(
 		eb.etcd.Name,
 		"alicloud",
+	)
+	return eb
+}
+
+func (eb *EtcdBuilder) WithProviderLocal() *EtcdBuilder {
+	if eb == nil || eb.etcd == nil {
+		return nil
+	}
+	eb.etcd.Spec.Backup.Store = getBackupStoreForLocal(
+		eb.etcd.Name,
 	)
 	return eb
 }
@@ -358,6 +370,15 @@ func getBackupStore(name string, provider druidv1alpha1.StorageProvider) *druidv
 		SecretRef: &corev1.SecretReference{
 			Name: "etcd-backup",
 		},
+	}
+}
+
+func getBackupStoreForLocal(name string) *druidv1alpha1.StoreSpec {
+	provider := druidv1alpha1.StorageProvider("local")
+	return &druidv1alpha1.StoreSpec{
+		Container: &container,
+		Prefix:    name,
+		Provider:  &provider,
 	}
 }
 

@@ -92,16 +92,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	if sts == nil {
-		if err := r.updateEtcdStatus(ctx, logger, etcd, nil); err != nil {
-			logger.Error(err, "Error while updating ETCD status when no StatefulSet found")
-		}
-		return ctrl.Result{
-			RequeueAfter: 5 * time.Second,
-		}, nil
-
-	}
-
 	if err := r.updateEtcdStatus(ctx, logger, etcd, sts); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -125,6 +115,7 @@ func (r *Reconciler) updateEtcdStatus(ctx context.Context, logger logr.Logger, e
 		etcd.Status.CurrentReplicas = sts.Status.CurrentReplicas
 		etcd.Status.ReadyReplicas = sts.Status.ReadyReplicas
 		etcd.Status.UpdatedReplicas = sts.Status.UpdatedReplicas
+		etcd.Status.Replicas = sts.Status.CurrentReplicas
 		etcd.Status.Ready = &ready
 		logger.Info("ETCD status updated for statefulset", "namespace", etcd.Namespace, "name", etcd.Name,
 			"currentReplicas", sts.Status.CurrentReplicas, "readyReplicas", sts.Status.ReadyReplicas, "updatedReplicas", sts.Status.UpdatedReplicas)

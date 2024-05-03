@@ -25,6 +25,7 @@ import (
 	"github.com/gardener/etcd-druid/pkg/features"
 	druidmetrics "github.com/gardener/etcd-druid/pkg/metrics"
 	"github.com/gardener/etcd-druid/pkg/utils"
+
 	"github.com/gardener/gardener/pkg/utils/imagevector"
 	kutil "github.com/gardener/gardener/pkg/utils/kubernetes"
 	"github.com/go-logr/logr"
@@ -35,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -82,7 +84,7 @@ func NewReconcilerWithImageVector(mgr manager.Manager, config *Config, imageVect
 
 // Reconcile reconciles the compaction job.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	r.logger.Info("Lease controller reconciliation started")
+	r.logger.Info("Compaction job reconciliation started")
 	etcd := &druidv1alpha1.Etcd{}
 	if err := r.Get(ctx, req.NamespacedName, etcd); err != nil {
 		if errors.IsNotFound(err) {
@@ -96,23 +98,84 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}, err
 	}
 
-	if !etcd.DeletionTimestamp.IsZero() {
+	if !etcd.DeletionTimestamp.IsZero() || etcd.Spec.Backup.Store == nil {
 		// Delete compaction job if exists
 		return r.delete(ctx, r.logger, etcd)
 	}
 
-	if etcd.Spec.Backup.Store == nil {
-		return ctrl.Result{}, nil
+	logger := r.logger.WithValues("etcd", kutil.Key(etcd.Namespace, etcd.Name).String())
+
+	return r.reconcileJob(ctx, logger, etcd)
+}
+
+func (r *Reconciler) reconcileJob(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) (ctrl.Result, error) {
+	// Update metrics for currently running compaction job, if any
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: etcd.GetCompactionJobName(), Namespace: etcd.Namespace}, job); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Currently, no compaction job is running in the namespace ", etcd.Namespace)
+		} else {
+			// Error reading the object - requeue the request.
+			return ctrl.Result{
+				RequeueAfter: 10 * time.Second,
+			}, fmt.Errorf("error while fetching compaction job with the name %v, in the namespace %v: %v", etcd.GetCompactionJobName(), etcd.Namespace, err)
+		}
 	}
 
-	logger := r.logger.WithValues("etcd", kutil.Key(etcd.Namespace, etcd.Name).String())
+	if job != nil && job.Name != "" {
+		if !job.DeletionTimestamp.IsZero() {
+			logger.Info("Job is already in deletion. A new job will be created only if the previous one has been deleted.", "namespace: ", job.Namespace, "name: ", job.Name)
+			return ctrl.Result{
+				RequeueAfter: 10 * time.Second,
+			}, nil
+		}
+
+		// Check if there is one active job or not
+		if job.Status.Active > 0 {
+			metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(1)
+			// Don't need to requeue if the job is currently running
+			return ctrl.Result{}, nil
+		}
+
+		// Delete job if the job succeeded
+		if job.Status.Succeeded > 0 {
+			metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(0)
+			if job.Status.CompletionTime != nil {
+				metricJobDurationSeconds.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededTrue, druidmetrics.EtcdNamespace: etcd.Namespace}).Observe(job.Status.CompletionTime.Time.Sub(job.Status.StartTime.Time).Seconds())
+			}
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); err != nil {
+				logger.Error(err, "Couldn't delete the successful job", "namespace", etcd.Namespace, "name", etcd.GetCompactionJobName())
+				return ctrl.Result{
+					RequeueAfter: 10 * time.Second,
+				}, fmt.Errorf("error while deleting successful compaction job: %v", err)
+			}
+			metricJobsTotal.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededTrue, druidmetrics.EtcdNamespace: etcd.Namespace}).Inc()
+		}
+
+		// Delete job and requeue if the job failed
+		if job.Status.Failed > 0 {
+			metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(0)
+			if job.Status.StartTime != nil {
+				metricJobDurationSeconds.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededFalse, druidmetrics.EtcdNamespace: etcd.Namespace}).Observe(time.Since(job.Status.StartTime.Time).Seconds())
+			}
+			err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground))
+			if err != nil {
+				return ctrl.Result{
+					RequeueAfter: 10 * time.Second,
+				}, fmt.Errorf("error while deleting failed compaction job: %v", err)
+			}
+			metricJobsTotal.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededFalse, druidmetrics.EtcdNamespace: etcd.Namespace}).Inc()
+			return ctrl.Result{
+				RequeueAfter: 10 * time.Second,
+			}, nil
+		}
+	}
 
 	// Get full and delta snapshot lease to check the HolderIdentity value to take decision on compaction job
 	fullLease := &coordinationv1.Lease{}
 
 	if err := r.Get(ctx, kutil.Key(etcd.Namespace, etcd.GetFullSnapshotLeaseName()), fullLease); err != nil {
 		logger.Error(err, "Couldn't fetch full snap lease", "namespace", etcd.Namespace, "name", etcd.GetFullSnapshotLeaseName())
-
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
 		}, err
@@ -121,7 +184,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	deltaLease := &coordinationv1.Lease{}
 	if err := r.Get(ctx, kutil.Key(etcd.Namespace, etcd.GetDeltaSnapshotLeaseName()), deltaLease); err != nil {
 		logger.Error(err, "Couldn't fetch delta snap lease", "namespace", etcd.Namespace, "name", etcd.GetDeltaSnapshotLeaseName())
-
 		return ctrl.Result{
 			RequeueAfter: 10 * time.Second,
 		}, err
@@ -156,77 +218,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Reconcile job only when number of accumulated revisions over the last full snapshot is more than the configured threshold value via 'events-threshold' flag
 	if diff >= r.config.EventsThreshold {
-		return r.reconcileJob(ctx, logger, etcd)
-	}
-
-	return ctrl.Result{}, nil
-}
-
-func (r *Reconciler) reconcileJob(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) (ctrl.Result, error) {
-	logger.Info("Reconcile etcd compaction job")
-
-	// First check if a job is already running
-	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: etcd.GetCompactionJobName(), Namespace: etcd.Namespace}, job)
-
-	if err != nil {
-		if !errors.IsNotFound(err) {
+		logger.Info("Creating etcd compaction job", "namespace", etcd.Namespace, "name", etcd.GetCompactionJobName())
+		job, err = r.createCompactionJob(ctx, logger, etcd)
+		if err != nil {
+			metricJobsTotal.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededFalse, druidmetrics.EtcdNamespace: etcd.Namespace}).Inc()
 			return ctrl.Result{
 				RequeueAfter: 10 * time.Second,
-			}, fmt.Errorf("error while fetching compaction job: %v", err)
+			}, fmt.Errorf("error during compaction job creation: %v", err)
 		}
-
-		if r.config.EnableBackupCompaction {
-			// Required job doesn't exist. Create new
-			logger.Info("Creating etcd compaction job", "namespace", etcd.Namespace, "name", etcd.GetCompactionJobName())
-			job, err = r.createCompactionJob(ctx, logger, etcd)
-			if err != nil {
-				return ctrl.Result{
-					RequeueAfter: 10 * time.Second,
-				}, fmt.Errorf("error during compaction job creation: %v", err)
-			}
-			metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(1)
-		}
-	}
-
-	if !job.DeletionTimestamp.IsZero() {
-		logger.Info("Job is already in deletion. A new job will be created only if the previous one has been deleted.", "namespace", job.Namespace, "name", job.Name)
-		return ctrl.Result{
-			RequeueAfter: 10 * time.Second,
-		}, nil
+		metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(1)
 	}
 
 	if job.Name != "" {
 		logger.Info("Current compaction job status",
 			"namespace", job.Namespace, "name", job.Name, "succeeded", job.Status.Succeeded)
-	}
-
-	// Delete job and requeue if the job failed
-	if job.Status.Failed > 0 {
-		metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(0)
-		if job.Status.StartTime != nil {
-			metricJobDurationSeconds.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededFalse, druidmetrics.EtcdNamespace: etcd.Namespace}).Observe(time.Since(job.Status.StartTime.Time).Seconds())
-		}
-		err = r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground))
-		if err != nil {
-			return ctrl.Result{
-				RequeueAfter: 10 * time.Second,
-			}, fmt.Errorf("error while deleting failed compaction job: %v", err)
-		}
-		metricJobsTotal.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededFalse, druidmetrics.EtcdNamespace: etcd.Namespace}).Inc()
-		return ctrl.Result{
-			RequeueAfter: 10 * time.Second,
-		}, nil
-	}
-
-	// Delete job and return if the job succeeded
-	if job.Status.Succeeded > 0 {
-		metricJobsTotal.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededTrue, druidmetrics.EtcdNamespace: etcd.Namespace}).Inc()
-		metricJobsCurrent.With(prometheus.Labels{druidmetrics.EtcdNamespace: etcd.Namespace}).Set(0)
-		if job.Status.CompletionTime != nil {
-			metricJobDurationSeconds.With(prometheus.Labels{druidmetrics.LabelSucceeded: druidmetrics.ValueSucceededTrue, druidmetrics.EtcdNamespace: etcd.Namespace}).Observe(job.Status.CompletionTime.Time.Sub(job.Status.StartTime.Time).Seconds())
-		}
-		return r.delete(ctx, logger, etcd)
 	}
 
 	return ctrl.Result{Requeue: false}, nil
@@ -260,7 +265,7 @@ func (r *Reconciler) delete(ctx context.Context, logger logr.Logger, etcd *druid
 func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) (*batchv1.Job, error) {
 	activeDeadlineSeconds := r.config.ActiveDeadlineDuration.Seconds()
 
-	_, etcdBackupImage, err := utils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
+	_, etcdBackupImage, _, err := utils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
 	if err != nil {
 		return nil, fmt.Errorf("couldn't fetch etcd backup image: %v", err)
 	}
@@ -299,14 +304,38 @@ func (r *Reconciler) createCompactionJob(ctx context.Context, logger logr.Logger
 						Name:            "compact-backup",
 						Image:           *etcdBackupImage,
 						ImagePullPolicy: v1.PullIfNotPresent,
-						Args:            getCompactionJobArgs(etcd),
-						VolumeMounts:    getCompactionJobVolumeMounts(etcd, logger),
-						Env:             getCompactionJobEnvVar(etcd, logger),
+						Args:            getCompactionJobArgs(etcd, r.config.MetricsScrapeWaitDuration.String()),
 					}},
-					Volumes: getCompactionJobVolumes(etcd, logger),
 				},
 			},
 		},
+	}
+
+	if vms, err := getCompactionJobVolumeMounts(etcd, r.config.FeatureGates); err != nil {
+		return nil, fmt.Errorf("error while creating compaction job in %v for %v : %v",
+			etcd.Namespace,
+			etcd.Name,
+			err)
+	} else {
+		job.Spec.Template.Spec.Containers[0].VolumeMounts = vms
+	}
+
+	if env, err := utils.GetBackupRestoreContainerEnvVars(etcd.Spec.Backup.Store); err != nil {
+		return nil, fmt.Errorf("error while creating compaction job in %v for %v : %v",
+			etcd.Namespace,
+			etcd.Name,
+			err)
+	} else {
+		job.Spec.Template.Spec.Containers[0].Env = env
+	}
+
+	if vm, err := getCompactionJobVolumes(ctx, r.Client, r.logger, etcd); err != nil {
+		return nil, fmt.Errorf("error creating compaction job in %v for %v : %v",
+			etcd.Namespace,
+			etcd.Name,
+			err)
+	} else {
+		job.Spec.Template.Spec.Volumes = vm
 	}
 
 	if etcd.Spec.Backup.CompactionResources != nil {
@@ -333,7 +362,7 @@ func getLabels(etcd *druidv1alpha1.Etcd) map[string]string {
 		"networking.gardener.cloud/to-public-networks":  "allowed",
 	}
 }
-func getCompactionJobVolumeMounts(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.VolumeMount {
+func getCompactionJobVolumeMounts(etcd *druidv1alpha1.Etcd, featureMap map[featuregate.Feature]bool) ([]v1.VolumeMount, error) {
 	vms := []v1.VolumeMount{
 		{
 			Name:      "etcd-workspace-dir",
@@ -341,32 +370,39 @@ func getCompactionJobVolumeMounts(etcd *druidv1alpha1.Etcd, logger logr.Logger) 
 		},
 	}
 
-	if etcd.Spec.Backup.Store == nil {
-		return vms
-	}
-
 	provider, err := utils.StorageProviderFromInfraProvider(etcd.Spec.Backup.Store.Provider)
 	if err != nil {
-		logger.Error(err, "Storage provider is not recognized. Compaction job will not mount any volume with provider specific credentials", "namespace", etcd.Namespace, "name", etcd.Name)
-		return vms
+		return vms, fmt.Errorf("storage provider is not recognized while fetching volume mounts")
 	}
-
-	if provider == utils.GCS {
+	switch provider {
+	case utils.Local:
+		if featureMap[features.UseEtcdWrapper] {
+			vms = append(vms, v1.VolumeMount{
+				Name:      "host-storage",
+				MountPath: "/home/nonroot/" + pointer.StringDeref(etcd.Spec.Backup.Store.Container, ""),
+			})
+		} else {
+			vms = append(vms, v1.VolumeMount{
+				Name:      "host-storage",
+				MountPath: pointer.StringDeref(etcd.Spec.Backup.Store.Container, ""),
+			})
+		}
+	case utils.GCS:
 		vms = append(vms, v1.VolumeMount{
 			Name:      "etcd-backup",
 			MountPath: "/var/.gcp/",
 		})
-	} else if provider == utils.S3 || provider == utils.ABS || provider == utils.OSS || provider == utils.Swift || provider == utils.OCS {
+	case utils.S3, utils.ABS, utils.OSS, utils.Swift, utils.OCS:
 		vms = append(vms, v1.VolumeMount{
 			Name:      "etcd-backup",
 			MountPath: "/var/etcd-backup/",
 		})
 	}
 
-	return vms
+	return vms, nil
 }
 
-func getCompactionJobVolumes(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.Volume {
+func getCompactionJobVolumes(ctx context.Context, cl client.Client, logger logr.Logger, etcd *druidv1alpha1.Etcd) ([]v1.Volume, error) {
 	vs := []v1.Volume{
 		{
 			Name: "etcd-workspace-dir",
@@ -376,22 +412,31 @@ func getCompactionJobVolumes(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.
 		},
 	}
 
-	if etcd.Spec.Backup.Store == nil {
-		return vs
-	}
-
 	storeValues := etcd.Spec.Backup.Store
 	provider, err := utils.StorageProviderFromInfraProvider(storeValues.Provider)
 	if err != nil {
-		logger.Error(err, "Storage provider is not recognized. Compaction job will fail as no storage could be configured", "namespace", etcd.Namespace, "name", etcd.Name)
-		return vs
+		return vs, fmt.Errorf("could not recognize storage provider while fetching volumes")
 	}
+	switch provider {
+	case "Local":
+		hostPath, err := utils.GetHostMountPathFromSecretRef(ctx, cl, logger, storeValues, etcd.Namespace)
+		if err != nil {
+			return vs, fmt.Errorf("could not determine host mount path for local provider")
+		}
 
-	if provider == utils.GCS || provider == utils.S3 || provider == utils.OSS || provider == utils.ABS || provider == utils.Swift || provider == utils.OCS {
+		hpt := v1.HostPathDirectory
+		vs = append(vs, v1.Volume{
+			Name: "host-storage",
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{
+					Path: hostPath + "/" + pointer.StringDeref(storeValues.Container, ""),
+					Type: &hpt,
+				},
+			},
+		})
+	case utils.GCS, utils.S3, utils.OSS, utils.ABS, utils.Swift, utils.OCS:
 		if storeValues.SecretRef == nil {
-			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.",
-				"namespace", etcd.Namespace, "name", etcd.Name)
-			return vs
+			return vs, fmt.Errorf("could not configure secretRef for backup store %v", provider)
 		}
 
 		vs = append(vs, v1.Volume{
@@ -404,91 +449,15 @@ func getCompactionJobVolumes(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.
 		})
 	}
 
-	return vs
+	return vs, nil
 }
 
-func getCompactionJobEnvVar(etcd *druidv1alpha1.Etcd, logger logr.Logger) []v1.EnvVar {
-	var env []v1.EnvVar
-	if etcd.Spec.Backup.Store == nil {
-		return env
-	}
-
-	storeValues := etcd.Spec.Backup.Store
-
-	env = append(env, getEnvVarFromValues("STORAGE_CONTAINER", *storeValues.Container))
-	env = append(env, getEnvVarFromFields("POD_NAMESPACE", "metadata.namespace"))
-
-	provider, err := utils.StorageProviderFromInfraProvider(etcd.Spec.Backup.Store.Provider)
-	if err != nil {
-		logger.Error(err, "Storage provider is not recognized. Compaction job will likely fail as there is no provider specific credentials.", "namespace", etcd.Namespace, "name", etcd.Name)
-		return env
-	}
-
-	switch provider {
-	case utils.S3:
-		env = append(env, getEnvVarFromValues("AWS_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
-	case utils.ABS:
-		env = append(env, getEnvVarFromValues("AZURE_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
-	case utils.GCS:
-		env = append(env, getEnvVarFromValues("GOOGLE_APPLICATION_CREDENTIALS", "/var/.gcp/serviceaccount.json"))
-	case utils.Swift:
-		env = append(env, getEnvVarFromValues("OPENSTACK_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
-	case utils.OSS:
-		env = append(env, getEnvVarFromValues("ALICLOUD_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
-	case utils.ECS:
-		if storeValues.SecretRef == nil {
-			logger.Info("No secretRef is configured for backup store. Compaction job will fail as no storage could be configured.",
-				"namespace", etcd.Namespace, "name", etcd.Name)
-			return env
-		}
-
-		env = append(env, getEnvVarFromSecrets("ECS_ENDPOINT", storeValues.SecretRef.Name, "endpoint"))
-		env = append(env, getEnvVarFromSecrets("ECS_ACCESS_KEY_ID", storeValues.SecretRef.Name, "accessKeyID"))
-		env = append(env, getEnvVarFromSecrets("ECS_SECRET_ACCESS_KEY", storeValues.SecretRef.Name, "secretAccessKey"))
-	case utils.OCS:
-		env = append(env, getEnvVarFromValues("OPENSHIFT_APPLICATION_CREDENTIALS", "/var/etcd-backup"))
-	}
-
-	return env
-}
-
-func getEnvVarFromValues(name, value string) v1.EnvVar {
-	return v1.EnvVar{
-		Name:  name,
-		Value: value,
-	}
-}
-
-func getEnvVarFromFields(name, fieldPath string) v1.EnvVar {
-	return v1.EnvVar{
-		Name: name,
-		ValueFrom: &v1.EnvVarSource{
-			FieldRef: &v1.ObjectFieldSelector{
-				FieldPath: fieldPath,
-			},
-		},
-	}
-}
-
-func getEnvVarFromSecrets(name, secretName, secretKey string) v1.EnvVar {
-	return v1.EnvVar{
-		Name: name,
-		ValueFrom: &v1.EnvVarSource{
-			SecretKeyRef: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
-					Name: secretName,
-				},
-				Key: secretKey,
-			},
-		},
-	}
-}
-
-func getCompactionJobArgs(etcd *druidv1alpha1.Etcd) []string {
+func getCompactionJobArgs(etcd *druidv1alpha1.Etcd, metricsScrapeWaitDuration string) []string {
 	command := []string{"compact"}
 	command = append(command, "--data-dir=/var/etcd/data/compaction.etcd")
 	command = append(command, "--restoration-temp-snapshots-dir=/var/etcd/data/compaction.restoration.temp")
 	command = append(command, "--snapstore-temp-directory=/var/etcd/data/tmp")
+	command = append(command, "--metrics-scrape-wait-duration="+metricsScrapeWaitDuration)
 	command = append(command, "--enable-snapshot-lease-renewal=true")
 	command = append(command, "--full-snapshot-lease-name="+etcd.GetFullSnapshotLeaseName())
 	command = append(command, "--delta-snapshot-lease-name="+etcd.GetDeltaSnapshotLeaseName())

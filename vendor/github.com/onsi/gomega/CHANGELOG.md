@@ -1,3 +1,27 @@
+## 1.27.8
+
+### Fixes
+- HaveExactElement should not call FailureMessage if a submatcher returned an error [096f392]
+
+### Maintenance
+- Bump github.com/onsi/ginkgo/v2 from 2.9.5 to 2.9.7 (#669) [8884bee]
+
+## 1.27.7
+
+### Fixes
+- fix: gcustom.MakeMatcher accepts nil as actual value (#666) [57054d5]
+
+### Maintenance
+- update gitignore [05c1bc6]
+- Bump github.com/onsi/ginkgo/v2 from 2.9.4 to 2.9.5 (#663) [7cadcf6]
+- Bump golang.org/x/net from 0.9.0 to 0.10.0 (#662) [b524839]
+- Bump github.com/onsi/ginkgo/v2 from 2.9.2 to 2.9.4 (#661) [5f44694]
+- Bump commonmarker from 0.23.8 to 0.23.9 in /docs (#657) [05dc99a]
+- Bump nokogiri from 1.14.1 to 1.14.3 in /docs (#658) [3a033d1]
+- Replace deprecated NewGomegaWithT with NewWithT (#659) [a19238f]
+- Bump golang.org/x/net from 0.8.0 to 0.9.0 (#656) [29ed041]
+- Bump actions/setup-go from 3 to 4 (#651) [11b2080]
+
 ## 1.27.6
 
 ### Fixes
@@ -179,7 +203,7 @@ These improvements are all documented in [Gomega's docs](https://onsi.github.io/
   This enables integration with Ginkgo 2.3.0's interruptible nodes and node timeouts.
 - Introduces Eventually.Within.ProbeEvery with tests and documentation (#591) [f633800]
 - New BeKeyOf matcher with documentation and unit tests (#590) [fb586b3]
-    
+
 ## Fixes
 - Cover the entire gmeasure suite with leak detection [8c54344]
 - Fix gmeasure leak [119d4ce]

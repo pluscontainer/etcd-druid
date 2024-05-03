@@ -7,7 +7,7 @@ build:
   local:
     useBuildkit: true
   artifacts:
-  - image: eu.gcr.io/gardener-project/gardener/etcd-druid
+  - image: europe-docker.pkg.dev/gardener-project/public/gardener/etcd-druid
     docker:
       dockerfile: Dockerfile
       target: druid
@@ -18,21 +18,23 @@ deploy:
       chartPath: charts/druid
       namespace: default
       artifactOverrides:
-        image: eu.gcr.io/gardener-project/gardener/etcd-druid
+        image: europe-docker.pkg.dev/gardener-project/public/gardener/etcd-druid
       imageStrategy:
         helm: {}
-      # Dependency builds create new dep archives and thus circumvent Docker's build cache at the next run.
       skipBuildDependencies: true
+      setValues:
+        enableBackupCompaction: "true"
+        eventsThreshold: 15
+        metricsScrapeWaitDuration: "30s"
 profiles:
-- name: use-feature-gates
+- name: do-not-use-feature-gates
   activation:
-  - env: "USE_ETCD_DRUID_FEATURE_GATES=true"
+  - env: "USE_ETCD_DRUID_FEATURE_GATES=false"
   patches:
   - op: add
-    path: /deploy/helm/releases/0/setValues
+    path: /deploy/helm/releases/0/setValues/featureGates
     value:
-      featureGates:
-        UseEtcdWrapper: true
+      UseEtcdWrapper: false
 ---
 apiVersion: skaffold/v2beta25
 kind: Config
@@ -73,8 +75,8 @@ profiles:
   - op: add
     path: /deploy/kustomize/paths
     value: [hack/e2e-test/infrastructure/overlays/aws/setup]
-- name: aws-cleanup
 # Profile to delete the S3 backup bucket from an e2e test.
+- name: aws-cleanup
   patches:
   - op: add
     path: /deploy/kustomize/paths
@@ -85,8 +87,8 @@ profiles:
   - op: add
     path: /deploy/kustomize/paths
     value: [hack/e2e-test/infrastructure/overlays/azure/setup]
-- name: azure-cleanup
 # Profile to delete the Azure storage container from an e2e test.
+- name: azure-cleanup
   patches:
   - op: add
     path: /deploy/kustomize/paths
@@ -108,8 +110,8 @@ profiles:
         "os": [darwin, linux]
       }
     }
+# Profile to delete the GCP backup bucket from an e2e test.
 - name: gcp-cleanup
-  # Profile to delete the GCP backup bucket from an e2e test.
   patches:
   - op: add
     path: /deploy/kustomize/paths
@@ -125,3 +127,15 @@ profiles:
         "os": [darwin, linux]
       }
     }
+# Profile to create the required Local storage container for an e2e test.
+- name: local-setup
+  patches:
+    - op: add
+      path: /deploy/kustomize/paths
+      value: [hack/e2e-test/infrastructure/overlays/local/setup]
+# Profile to delete the Local storage container from an e2e test.
+- name: local-cleanup
+  patches:
+    - op: add
+      path: /deploy/kustomize/paths
+      value: [hack/e2e-test/infrastructure/overlays/local/cleanup]

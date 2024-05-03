@@ -95,7 +95,7 @@ var _ = Describe("Etcd", func() {
 
 	Context("GetCompactionJobName", func() {
 		It("should return the correct compaction job name", func() {
-			Expect(created.GetCompactionJobName()).To(Equal("123456-compact-job"))
+			Expect(created.GetCompactionJobName()).To(Equal("foo-compactor"))
 		})
 	})
 
@@ -168,8 +168,8 @@ func getEtcd(name, namespace string) *Etcd {
 	deltaSnapshotPeriod := metav1.Duration{
 		Duration: 300 * time.Second,
 	}
-	imageEtcd := "eu.gcr.io/gardener-project/gardener/etcd-wrapper:v0.1.0"
-	imageBR := "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.25.0"
+	imageEtcd := "europe-docker.pkg.dev/gardener-project/public/gardener/etcd-wrapper:v0.1.0"
+	imageBR := "europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl:v0.25.0"
 	snapshotSchedule := "0 */24 * * *"
 	defragSchedule := "0 */24 * * *"
 	container := "my-object-storage-container-name"

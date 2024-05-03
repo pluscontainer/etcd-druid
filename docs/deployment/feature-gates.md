@@ -1,3 +1,7 @@
+---
+title: Feature Gates in Etcd-Druid
+---
+
 # Feature Gates in Etcd-Druid
 
 This page contains an overview of the various feature gates an administrator can specify on etcd-druid.
@@ -18,7 +22,8 @@ The following tables are a summary of the feature gates that you can set on etcd
 
 | Feature          | Default | Stage   | Since  | Until |
 |------------------|---------|---------|--------|-------|
-| `UseEtcdWrapper` | `false` | `Alpha` | `0.19` |       |
+| `UseEtcdWrapper` | `false` | `Alpha` | `0.19` | `0.21`|
+| `UseEtcdWrapper` | `true`  | `Beta`  | `0.22` |       |
 
 ## Feature Gates for Graduated or Deprecated Features
 

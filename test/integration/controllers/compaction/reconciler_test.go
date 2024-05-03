@@ -19,16 +19,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gardener/gardener/pkg/controllerutils"
-	"github.com/gardener/gardener/pkg/utils/test/matchers"
-
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
+	"github.com/gardener/etcd-druid/pkg/common"
 	"github.com/gardener/etcd-druid/pkg/utils"
 	testutils "github.com/gardener/etcd-druid/test/utils"
+
+	"github.com/gardener/gardener/pkg/controllerutils"
+	"github.com/gardener/gardener/pkg/utils/test/matchers"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gstruct"
-
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -87,7 +87,7 @@ var _ = Describe("Compaction Controller", func() {
 
 			deleteEtcdSnapshotLeasesAndWait(k8sClient, instance)
 		},
-		Entry("if fields are set in etcd.Spec and TLS enabled, the resources should reflect the spec changes", "foo71", druidv1alpha1.StorageProvider("Local"), validateEtcdForCompactionJob),
+		Entry("if fields are set in etcd.Spec and TLS enabled, the resources should reflect the spec changes", "foo71", druidv1alpha1.StorageProvider("local"), validateEtcdForCompactionJob),
 		Entry("if the store is S3, the statefulset and compaction job should reflect the spec changes", "foo72", druidv1alpha1.StorageProvider("aws"), validateStoreAWSForCompactionJob),
 		Entry("if the store is ABS, the statefulset and compaction job should reflect the spec changes", "foo73", druidv1alpha1.StorageProvider("azure"), validateStoreAzureForCompactionJob),
 		Entry("if the store is GCS, the statefulset and compaction job should reflect the spec changes", "foo74", druidv1alpha1.StorageProvider("gcp"), validateStoreGCPForCompactionJob),
@@ -112,21 +112,15 @@ var _ = Describe("Compaction Controller", func() {
 			ctx, cancel := context.WithTimeout(context.TODO(), timeout)
 			defer cancel()
 
-			instance = testutils.EtcdBuilderWithDefaults("foo77", namespace).Build()
+			instance = testutils.EtcdBuilderWithDefaults("foo77", namespace).WithProviderLocal().Build()
 			createEtcdAndWait(k8sClient, instance)
 
 			// manually create full and delta snapshot leases since etcd controller is not running
 			fullSnapLease, deltaSnapLease = createEtcdSnapshotLeasesAndWait(k8sClient, instance)
 
 			// manually create compaction job
-			j = createCompactionJob(instance)
-			Expect(k8sClient.Create(ctx, j)).To(Succeed())
-
-			Eventually(func() error { return jobIsCorrectlyReconciled(k8sClient, instance, j) }, timeout, pollingInterval).Should(BeNil())
-
-			// Update job status as failed
-			j.Status.Failed = 1
-			Expect(k8sClient.Status().Update(ctx, j)).To(Succeed())
+			// j = createCompactionJob(instance)
+			// Expect(k8sClient.Create(ctx, j)).To(Succeed())
 
 			// Deliberately update the full lease
 			fullSnapLease.Spec.HolderIdentity = pointer.String("0")
@@ -137,6 +131,15 @@ var _ = Describe("Compaction Controller", func() {
 			deltaSnapLease.Spec.HolderIdentity = pointer.String("101")
 			deltaSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
 			Expect(k8sClient.Update(context.TODO(), deltaSnapLease)).To(Succeed())
+
+			j = &batchv1.Job{}
+			Eventually(func() error {
+				return jobIsCorrectlyReconciled(k8sClient, instance, j)
+			}, timeout, pollingInterval).Should(BeNil())
+
+			// Update job status as failed
+			j.Status.Failed = 1
+			Expect(k8sClient.Status().Update(ctx, j)).To(Succeed())
 
 			// Wait until the job gets the "foregroundDeletion" finalizer and remove it
 			Eventually(func() (*batchv1.Job, error) {
@@ -161,21 +164,11 @@ var _ = Describe("Compaction Controller", func() {
 			ctx, cancel := context.WithTimeout(context.TODO(), timeout)
 			defer cancel()
 
-			instance = testutils.EtcdBuilderWithDefaults("foo78", "default").Build()
+			instance = testutils.EtcdBuilderWithDefaults("foo78", "default").WithProviderLocal().Build()
 			createEtcdAndWait(k8sClient, instance)
 
 			// manually create full and delta snapshot leases since etcd controller is not running
 			fullSnapLease, deltaSnapLease = createEtcdSnapshotLeasesAndWait(k8sClient, instance)
-
-			// create compaction job
-			j := createCompactionJob(instance)
-			Expect(k8sClient.Create(ctx, j)).To(Succeed())
-
-			Eventually(func() error { return jobIsCorrectlyReconciled(k8sClient, instance, j) }, timeout, pollingInterval).Should(BeNil())
-
-			// Update job status as succeeded
-			j.Status.Succeeded = 1
-			Expect(k8sClient.Status().Update(context.TODO(), j)).To(Succeed())
 
 			// Deliberately update the full lease
 			fullSnapLease.Spec.HolderIdentity = pointer.String("0")
@@ -186,6 +179,15 @@ var _ = Describe("Compaction Controller", func() {
 			deltaSnapLease.Spec.HolderIdentity = pointer.String("101")
 			deltaSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
 			Expect(k8sClient.Update(context.TODO(), deltaSnapLease)).To(Succeed())
+
+			j = &batchv1.Job{}
+			Eventually(func() error {
+				return jobIsCorrectlyReconciled(k8sClient, instance, j)
+			}, timeout, pollingInterval).Should(BeNil())
+
+			// Update job status as succeeded
+			j.Status.Succeeded = 1
+			Expect(k8sClient.Status().Update(context.TODO(), j)).To(Succeed())
 
 			// Wait until the job gets the "foregroundDeletion" finalizer and remove it
 			Eventually(func() (*batchv1.Job, error) {
@@ -206,26 +208,30 @@ var _ = Describe("Compaction Controller", func() {
 			ctx, cancel := context.WithTimeout(context.TODO(), timeout)
 			defer cancel()
 
-			instance = testutils.EtcdBuilderWithDefaults("foo79", "default").Build()
+			instance = testutils.EtcdBuilderWithDefaults("foo79", "default").WithProviderLocal().Build()
 			createEtcdAndWait(k8sClient, instance)
 
 			// manually create full and delta snapshot leases since etcd controller is not running
 			fullSnapLease, deltaSnapLease = createEtcdSnapshotLeasesAndWait(k8sClient, instance)
 
-			// create compaction job
-			j := createCompactionJob(instance)
-			Expect(k8sClient.Create(ctx, j)).To(Succeed())
+			// Deliberately update the full lease
+			fullSnapLease.Spec.HolderIdentity = pointer.String("0")
+			fullSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+			Expect(k8sClient.Update(context.TODO(), fullSnapLease)).To(Succeed())
 
-			Eventually(func() error { return jobIsCorrectlyReconciled(k8sClient, instance, j) }, timeout, pollingInterval).Should(BeNil())
+			// Deliberately update the delta lease
+			deltaSnapLease.Spec.HolderIdentity = pointer.String("101")
+			deltaSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+			Expect(k8sClient.Update(context.TODO(), deltaSnapLease)).To(Succeed())
+
+			j = &batchv1.Job{}
+			Eventually(func() error {
+				return jobIsCorrectlyReconciled(k8sClient, instance, j)
+			}, timeout, pollingInterval).Should(BeNil())
 
 			// Update job status as active
 			j.Status.Active = 1
 			Expect(k8sClient.Status().Update(ctx, j)).To(Succeed())
-
-			// Deliberately update the delta lease
-			deltaSnapLease.Spec.HolderIdentity = pointer.String("100")
-			deltaSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
-			Expect(k8sClient.Update(context.TODO(), deltaSnapLease)).To(Succeed())
 
 			// The active job should exist
 			Eventually(func() error {
@@ -239,8 +245,47 @@ var _ = Describe("Compaction Controller", func() {
 			}, timeout, pollingInterval).Should(BeNil())
 		})
 
-	})
+		It("should let the existing job run even without any lease update", func() {
+			ctx, cancel := context.WithTimeout(context.TODO(), timeout)
+			defer cancel()
 
+			instance = testutils.EtcdBuilderWithDefaults("foo80", "default").WithProviderLocal().Build()
+			createEtcdAndWait(k8sClient, instance)
+
+			// manually create full and delta snapshot leases since etcd controller is not running
+			fullSnapLease, deltaSnapLease = createEtcdSnapshotLeasesAndWait(k8sClient, instance)
+
+			// Deliberately update the full lease
+			fullSnapLease.Spec.HolderIdentity = pointer.String("0")
+			fullSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+			Expect(k8sClient.Update(context.TODO(), fullSnapLease)).To(Succeed())
+
+			// Deliberately update the delta lease
+			deltaSnapLease.Spec.HolderIdentity = pointer.String("101")
+			deltaSnapLease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
+			Expect(k8sClient.Update(context.TODO(), deltaSnapLease)).To(Succeed())
+
+			j = &batchv1.Job{}
+			Eventually(func() error {
+				return jobIsCorrectlyReconciled(k8sClient, instance, j)
+			}, timeout, pollingInterval).Should(BeNil())
+
+			// Update job status as active
+			j.Status.Active = 1
+			Expect(k8sClient.Status().Update(ctx, j)).To(Succeed())
+
+			// The active job should exist
+			Eventually(func() error {
+				if err := jobIsCorrectlyReconciled(k8sClient, instance, j); err != nil {
+					return err
+				}
+				if j.Status.Active != 1 {
+					return fmt.Errorf("compaction job is not currently active")
+				}
+				return nil
+			}, timeout, pollingInterval).Should(BeNil())
+		})
+	})
 })
 
 func validateEtcdForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.Job) {
@@ -273,6 +318,7 @@ func validateEtcdForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.Job) 
 								"--data-dir=/var/etcd/data/compaction.etcd":                                                                 Equal("--data-dir=/var/etcd/data/compaction.etcd"),
 								"--restoration-temp-snapshots-dir=/var/etcd/data/compaction.restoration.temp":                               Equal("--restoration-temp-snapshots-dir=/var/etcd/data/compaction.restoration.temp"),
 								"--snapstore-temp-directory=/var/etcd/data/tmp":                                                             Equal("--snapstore-temp-directory=/var/etcd/data/tmp"),
+								"--metrics-scrape-wait-duration=1m0s":                                                                       Equal("--metrics-scrape-wait-duration=1m0s"),
 								"--enable-snapshot-lease-renewal=true":                                                                      Equal("--enable-snapshot-lease-renewal=true"),
 								fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", instance.GetFullSnapshotLeaseName()):                     Equal(fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", instance.GetFullSnapshotLeaseName())),
 								fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", instance.GetDeltaSnapshotLeaseName()):                   Equal(fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", instance.GetDeltaSnapshotLeaseName())),
@@ -292,12 +338,20 @@ func validateEtcdForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.Job) 
 								}),
 							}),
 							"Env": MatchElements(testutils.EnvIterator, IgnoreExtras, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
@@ -314,6 +368,14 @@ func validateEtcdForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.Job) 
 								"HostPath": BeNil(),
 								"EmptyDir": PointTo(MatchFields(IgnoreExtras, Fields{
 									"SizeLimit": BeNil(),
+								})),
+							}),
+						}),
+						"host-storage": MatchFields(IgnoreExtras, Fields{
+							"Name": Equal("host-storage"),
+							"VolumeSource": MatchFields(IgnoreExtras, Fields{
+								"HostPath": PointTo(MatchFields(IgnoreExtras, Fields{
+									"Path": Equal("/etc/gardener/local-backupbuckets/default.bkp"),
 								})),
 							}),
 						}),
@@ -343,21 +405,41 @@ func validateStoreGCPForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.J
 								}),
 							}),
 							"Env": MatchAllElements(testutils.EnvIterator, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"GOOGLE_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("GOOGLE_APPLICATION_CREDENTIALS"),
+								common.EnvGoogleApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvGoogleApplicationCredentials),
 									"Value": Equal("/var/.gcp/serviceaccount.json"),
+								}),
+								common.EnvGoogleStorageAPIEndpoint: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvGoogleStorageAPIEndpoint),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"SecretKeyRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"LocalObjectReference": MatchFields(IgnoreExtras, Fields{
+												"Name": Equal(instance.Spec.Backup.Store.SecretRef.Name),
+											}),
+											"Key":      Equal("storageAPIEndpoint"),
+											"Optional": Equal(pointer.Bool(true)),
+										})),
+									})),
 								}),
 							}),
 						}),
@@ -391,20 +473,28 @@ func validateStoreAWSForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1.J
 								fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container): Equal(fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container)),
 							}),
 							"Env": MatchAllElements(testutils.EnvIterator, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"AWS_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("AWS_APPLICATION_CREDENTIALS"),
+								common.EnvAWSApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvAWSApplicationCredentials),
 									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
@@ -439,20 +529,28 @@ func validateStoreAzureForCompactionJob(instance *druidv1alpha1.Etcd, j *batchv1
 								fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container): Equal(fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container)),
 							}),
 							"Env": MatchAllElements(testutils.EnvIterator, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"AZURE_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("AZURE_APPLICATION_CREDENTIALS"),
+								common.EnvAzureApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvAzureApplicationCredentials),
 									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
@@ -487,20 +585,28 @@ func validateStoreOpenstackForCompactionJob(instance *druidv1alpha1.Etcd, j *bat
 								fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container): Equal(fmt.Sprintf("%s=%s", "--store-container", *instance.Spec.Backup.Store.Container)),
 							}),
 							"Env": MatchAllElements(testutils.EnvIterator, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"OPENSTACK_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("OPENSTACK_APPLICATION_CREDENTIALS"),
+								common.EnvOpenstackApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvOpenstackApplicationCredentials),
 									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
@@ -536,20 +642,28 @@ func validateStoreAlicloudForCompactionJob(instance *druidv1alpha1.Etcd, j *batc
 							}),
 							"ImagePullPolicy": Equal(corev1.PullIfNotPresent),
 							"Env": MatchAllElements(testutils.EnvIterator, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*instance.Spec.Backup.Store.Container),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
+									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
+										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
+											"FieldPath": Equal("metadata.name"),
+										})),
+									})),
+								}),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"ALICLOUD_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("ALICLOUD_APPLICATION_CREDENTIALS"),
+								common.EnvAlicloudApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvAlicloudApplicationCredentials),
 									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
@@ -589,36 +703,6 @@ func jobIsCorrectlyReconciled(c client.Client, instance *druidv1alpha1.Etcd, job
 	}
 
 	return nil
-}
-
-func createCompactionJob(instance *druidv1alpha1.Etcd) *batchv1.Job {
-	j := batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instance.GetCompactionJobName(),
-			Namespace: instance.Namespace,
-			Labels:    instance.Labels,
-		},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: pointer.Int32(0),
-			Completions:  pointer.Int32(1),
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: instance.Labels,
-				},
-				Spec: corev1.PodSpec{
-					RestartPolicy: "Never",
-					Containers: []corev1.Container{
-						{
-							Name:    "compact-backup",
-							Image:   "eu.gcr.io/gardener-project/alpine:3.14",
-							Command: []string{"sh", "-c", "tail -f /dev/null"},
-						},
-					},
-				},
-			},
-		},
-	}
-	return &j
 }
 
 func etcdSnapshotLeaseIsCorrectlyReconciled(c client.Client, instance *druidv1alpha1.Etcd, lease *coordinationv1.Lease) error {

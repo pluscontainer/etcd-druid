@@ -97,6 +97,9 @@ const (
 	defaultInterval = 5 * time.Second
 	// defaultTimeout is the default timeout for retry operations.
 	defaultTimeout = 90 * time.Second
+
+	// ScaleToMultiNodeAnnotationKey is used to represent scale-up annotation.
+	ScaleToMultiNodeAnnotationKey = "gardener.cloud/scaled-to-multi-node"
 )
 
 // Wait waits for the deployment of the StatefulSet to finish
@@ -388,7 +391,7 @@ func immutableFieldUpdate(sts *appsv1.StatefulSet, val Values) bool {
 func clusterScaledUpToMultiNode(val *Values, sts *appsv1.StatefulSet) bool {
 	if sts != nil && sts.Spec.Replicas != nil {
 		return (val.Replicas > 1 && *sts.Spec.Replicas == 1 && sts.Status.AvailableReplicas == 1) ||
-			(metav1.HasAnnotation(sts.ObjectMeta, scaleToMultiNodeAnnotationKey) &&
+			(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey) &&
 				(sts.Status.UpdatedReplicas < *sts.Spec.Replicas || sts.Status.AvailableReplicas < sts.Status.UpdatedReplicas))
 	}
 	return val.Replicas > 1 && val.StatusReplicas == 1
@@ -433,7 +436,7 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 							Name:            "etcd",
 							Image:           c.values.EtcdImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args:            c.values.EtcdCommand,
+							Args:            c.values.EtcdCommandArgs,
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler:        getReadinessHandler(c.values),
 								InitialDelaySeconds: 15,
@@ -449,10 +452,9 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 							Name:            "backup-restore",
 							Image:           c.values.BackupImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args:            c.values.EtcdBackupCommand,
+							Args:            c.values.EtcdBackupRestoreCommandArgs,
 							Ports:           getBackupPorts(c.values),
 							Resources:       getBackupResources(c.values),
-							Env:             getBackupRestoreEnvVars(c.values),
 							VolumeMounts:    getBackupRestoreVolumeMounts(c),
 							SecurityContext: &corev1.SecurityContext{
 								Capabilities: &corev1.Capabilities{
@@ -543,6 +545,11 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 			})
 		}
 
+		if backupRestoreEnvVars, err := utils.GetBackupRestoreContainerEnvVars(c.values.BackupStore); err != nil {
+			return fmt.Errorf("unable to fetch env vars for backup-restore container: %v", err)
+		} else {
+			sts.Spec.Template.Spec.Containers[1].Env = backupRestoreEnvVars
+		}
 		if c.values.StorageClass != nil && *c.values.StorageClass != "" {
 			sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName = c.values.StorageClass
 		}
@@ -554,11 +561,12 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 			// TODO: @aaronfern add this back to sts.Spec when UseEtcdWrapper becomes GA
 			sts.Spec.Template.Spec.InitContainers = []corev1.Container{
 				{
-					Name:         "change-permissions",
-					Image:        "alpine:3.18.2",
-					Command:      []string{"sh", "-c", "--"},
-					Args:         []string{"chown -R 65532:65532 /var/etcd/data"},
-					VolumeMounts: getEtcdVolumeMounts(c.values),
+					Name:            "change-permissions",
+					Image:           c.values.InitContainerImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"sh", "-c", "--"},
+					Args:            []string{"chown -R 65532:65532 /var/etcd/data"},
+					VolumeMounts:    getEtcdVolumeMounts(c.values),
 					SecurityContext: &corev1.SecurityContext{
 						RunAsGroup:   pointer.Int64(0),
 						RunAsNonRoot: pointer.Bool(false),
@@ -572,11 +580,12 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 				prov, _ := utils.StorageProviderFromInfraProvider(c.values.BackupStore.Provider)
 				if prov == utils.Local {
 					sts.Spec.Template.Spec.InitContainers = append(sts.Spec.Template.Spec.InitContainers, corev1.Container{
-						Name:         "change-backup-bucket-permissions",
-						Image:        "alpine:3.18.2",
-						Command:      []string{"sh", "-c", "--"},
-						Args:         []string{fmt.Sprintf("chown -R 65532:65532 /home/nonroot/%s", *c.values.BackupStore.Container)},
-						VolumeMounts: getBackupRestoreVolumeMounts(c),
+						Name:            "change-backup-bucket-permissions",
+						Image:           c.values.InitContainerImage,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Command:         []string{"sh", "-c", "--"},
+						Args:            []string{fmt.Sprintf("chown -R 65532:65532 /home/nonroot/%s", *c.values.BackupStore.Container)},
+						VolumeMounts:    getBackupRestoreVolumeMounts(c),
 						SecurityContext: &corev1.SecurityContext{
 							RunAsGroup:   pointer.Int64(0),
 							RunAsNonRoot: pointer.Bool(false),
@@ -661,10 +670,6 @@ func getObjectMeta(val *Values, sts *appsv1.StatefulSet, preserveAnnotations boo
 	}
 }
 
-const (
-	scaleToMultiNodeAnnotationKey = "gardener.cloud/scaled-to-multi-node"
-)
-
 func getStsAnnotations(val *Values, sts *appsv1.StatefulSet) map[string]string {
 	annotations := utils.MergeStringMaps(
 		map[string]string{
@@ -675,7 +680,7 @@ func getStsAnnotations(val *Values, sts *appsv1.StatefulSet) map[string]string {
 	)
 
 	if clusterScaledUpToMultiNode(val, sts) {
-		annotations[scaleToMultiNodeAnnotationKey] = ""
+		annotations[ScaleToMultiNodeAnnotationKey] = ""
 	}
 	return annotations
 }
@@ -732,8 +737,8 @@ func getEtcdEnvVars(val Values) []corev1.EnvVar {
 	endpoint := fmt.Sprintf("%s://%s-local:%d", protocol, val.Name, pointer.Int32Deref(val.BackupPort, defaultBackupPort))
 
 	return []corev1.EnvVar{
-		getEnvVarFromValue("ENABLE_TLS", strconv.FormatBool(val.BackupTLS != nil)),
-		getEnvVarFromValue("BACKUP_ENDPOINT", endpoint),
+		utils.GetEnvVarFromValue("ENABLE_TLS", strconv.FormatBool(val.BackupTLS != nil)),
+		utils.GetEnvVarFromValue("BACKUP_ENDPOINT", endpoint),
 	}
 }
 
@@ -998,93 +1003,6 @@ func getVolumes(ctx context.Context, cl client.Client, logger logr.Logger, val V
 	}
 
 	return vs, nil
-}
-
-func getBackupRestoreEnvVars(val Values) []corev1.EnvVar {
-	var (
-		env              []corev1.EnvVar
-		storageContainer string
-		storeValues      = val.BackupStore
-	)
-
-	if val.BackupStore != nil {
-		storageContainer = pointer.StringDeref(val.BackupStore.Container, "")
-	}
-
-	// TODO(timuthy, shreyas-s-rao): Move STORAGE_CONTAINER a few lines below so that we can append and exit in one step. This should only be done in a release where a restart of etcd is acceptable.
-	env = append(env, getEnvVarFromValue("STORAGE_CONTAINER", storageContainer))
-	env = append(env, getEnvVarFromField("POD_NAME", "metadata.name"))
-	env = append(env, getEnvVarFromField("POD_NAMESPACE", "metadata.namespace"))
-
-	if storeValues == nil {
-		return env
-	}
-
-	provider, err := utils.StorageProviderFromInfraProvider(val.BackupStore.Provider)
-	if err != nil {
-		return env
-	}
-
-	// TODO(timuthy): move this to a non root path when we switch to a rootless distribution
-	const credentialsMountPath = "/var/etcd-backup"
-	switch provider {
-	case utils.S3:
-		env = append(env, getEnvVarFromValue("AWS_APPLICATION_CREDENTIALS", credentialsMountPath))
-
-	case utils.ABS:
-		env = append(env, getEnvVarFromValue("AZURE_APPLICATION_CREDENTIALS", credentialsMountPath))
-
-	case utils.GCS:
-		env = append(env, getEnvVarFromValue("GOOGLE_APPLICATION_CREDENTIALS", "/var/.gcp/serviceaccount.json"))
-
-	case utils.Swift:
-		env = append(env, getEnvVarFromValue("OPENSTACK_APPLICATION_CREDENTIALS", credentialsMountPath))
-
-	case utils.OSS:
-		env = append(env, getEnvVarFromValue("ALICLOUD_APPLICATION_CREDENTIALS", credentialsMountPath))
-
-	case utils.ECS:
-		env = append(env, getEnvVarFromSecrets("ECS_ENDPOINT", storeValues.SecretRef.Name, "endpoint"))
-		env = append(env, getEnvVarFromSecrets("ECS_ACCESS_KEY_ID", storeValues.SecretRef.Name, "accessKeyID"))
-		env = append(env, getEnvVarFromSecrets("ECS_SECRET_ACCESS_KEY", storeValues.SecretRef.Name, "secretAccessKey"))
-
-	case utils.OCS:
-		env = append(env, getEnvVarFromValue("OPENSHIFT_APPLICATION_CREDENTIALS", credentialsMountPath))
-	}
-
-	return env
-}
-
-func getEnvVarFromValue(name, value string) corev1.EnvVar {
-	return corev1.EnvVar{
-		Name:  name,
-		Value: value,
-	}
-}
-
-func getEnvVarFromField(name, fieldPath string) corev1.EnvVar {
-	return corev1.EnvVar{
-		Name: name,
-		ValueFrom: &corev1.EnvVarSource{
-			FieldRef: &corev1.ObjectFieldSelector{
-				FieldPath: fieldPath,
-			},
-		},
-	}
-}
-
-func getEnvVarFromSecrets(name, secretName, secretKey string) corev1.EnvVar {
-	return corev1.EnvVar{
-		Name: name,
-		ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: secretName,
-				},
-				Key: secretKey,
-			},
-		},
-	}
 }
 
 func getReadinessHandler(val Values) corev1.ProbeHandler {

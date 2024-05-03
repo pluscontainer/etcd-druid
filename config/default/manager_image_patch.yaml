@@ -8,5 +8,5 @@ spec:
     spec:
       containers:
         # Change the value of image field below to your controller image URL
-        - image: node-647ee1368442ecd1a315c673.ps-xaas.io/gardener/etcd-druid:v0.19.3-in-memory-dev-0.0.21
+        - image: node-647ee1368442ecd1a315c673.ps-xaas.io/gardener/etcd-druid:v0.22.0-in-memory-dev-0.0.21
           name: druid

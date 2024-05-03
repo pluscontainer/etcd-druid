@@ -251,13 +251,7 @@ func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl
 	}
 
 	pdbValues := componentpdb.GenerateValues(etcd)
-	k8sversion, err := druidutils.GetClusterK8sVersion(r.restConfig)
-	if err != nil {
-		return ctrl.Result{
-			Requeue: true,
-		}, err
-	}
-	pdbDeployer := componentpdb.New(r.Client, etcd.Namespace, &pdbValues, *k8sversion)
+	pdbDeployer := componentpdb.New(r.Client, etcd.Namespace, &pdbValues)
 	if err := pdbDeployer.Destroy(ctx); err != nil {
 		return ctrl.Result{
 			Requeue: true,
@@ -307,7 +301,7 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 		return reconcileResult{err: fmt.Errorf("Spec.Replicas should not be even number: %d", etcd.Spec.Replicas)}
 	}
 
-	etcdImage, etcdBackupImage, err := druidutils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
+	etcdImage, etcdBackupImage, initContainerImage, err := druidutils.GetEtcdImages(etcd, r.imageVector, r.config.FeatureGates[features.UseEtcdWrapper])
 	if err != nil {
 		return reconcileResult{err: err}
 	}
@@ -325,18 +319,13 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 	}
 
 	configMapValues := componentconfigmap.GenerateValues(etcd)
-
 	cmDeployer := componentconfigmap.New(r.Client, etcd.Namespace, configMapValues)
 	if err := cmDeployer.Deploy(ctx); err != nil {
 		return reconcileResult{err: err}
 	}
 
 	pdbValues := componentpdb.GenerateValues(etcd)
-	k8sversion, err := druidutils.GetClusterK8sVersion(r.restConfig)
-	if err != nil {
-		return reconcileResult{err: err}
-	}
-	pdbDeployer := componentpdb.New(r.Client, etcd.Namespace, &pdbValues, *k8sversion)
+	pdbDeployer := componentpdb.New(r.Client, etcd.Namespace, &pdbValues)
 	if err := pdbDeployer.Deploy(ctx); err != nil {
 		return reconcileResult{err: err}
 	}
@@ -368,22 +357,26 @@ func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd
 	}
 
 	peerUrlTLSChangedToEnabled := isPeerTLSChangedToEnabled(peerTLSEnabled, configMapValues)
-	statefulSetValues := componentsts.GenerateValues(
+	statefulSetValues, err := componentsts.GenerateValues(
 		etcd,
 		&serviceValues.ClientPort,
 		&serviceValues.PeerPort,
 		&serviceValues.BackupPort,
 		*etcdImage,
 		*etcdBackupImage,
+		*initContainerImage,
 		map[string]string{
 			"checksum/etcd-configmap": configMapValues.ConfigMapChecksum,
 		}, peerUrlTLSChangedToEnabled,
 		r.config.FeatureGates[features.UseEtcdWrapper],
 	)
+	if err != nil {
+		return reconcileResult{err: err}
+	}
 
 	// Create an OpWaiter because after the deployment we want to wait until the StatefulSet is ready.
 	var (
-		stsDeployer  = componentsts.New(r.Client, logger, statefulSetValues, r.config.FeatureGates)
+		stsDeployer  = componentsts.New(r.Client, logger, *statefulSetValues, r.config.FeatureGates)
 		deployWaiter = gardenercomponent.OpWait(stsDeployer)
 	)
 

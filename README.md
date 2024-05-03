@@ -1,5 +1,7 @@
 # ETCD Druid
 
+<image src="logo/etcd-druid-logo.png" style="width:300px"></image>
+
 [![CI Build status](https://concourse.ci.gardener.cloud/api/v1/teams/gardener/pipelines/etcd-druid-master/jobs/master-head-update-job/badge)](https://concourse.ci.gardener.cloud/teams/gardener/pipelines/etcd-druid-master/jobs/master-head-update-job)
 [![Go Report Card](https://goreportcard.com/badge/github.com/gardener/gardener)](https://goreportcard.com/report/github.com/gardener/etcd-druid)
 
@@ -28,8 +30,6 @@ The existing method of deploying etcd and backup-sidecar as a StatefulSet allevi
 The etcd CRD should contain the information required to create the etcd and backup-restore sidecar in a pod/statefulset.
 
 ```yaml
----
-
 apiVersion: druid.gardener.cloud/v1alpha1
 kind: Etcd
 metadata:
@@ -51,7 +51,7 @@ spec:
     fullSnapshotSchedule: 0 */24 * * *
     garbageCollectionPeriod: 43200s
     garbageCollectionPolicy: Exponential
-    imageRepository: eu.gcr.io/gardener-project/gardener/etcdbrctl
+    imageRepository: europe-docker.pkg.dev/gardener-project/public/gardener/etcdbrctl
     imageVersion: v0.25.0
     port: 8080
     resources:
@@ -67,7 +67,7 @@ spec:
     clientPort: 2379
     defragmentationSchedule: 0 */24 * * *
     enableTLS: false
-    imageRepository: eu.gcr.io/gardener-project/gardener/etcd-wrapper
+    imageRepository: europe-docker.pkg.dev/gardener-project/public/gardener/etcd-wrapper
     imageVersion: v0.1.0
     initialClusterState: new
     initialClusterToken: new
@@ -119,8 +119,12 @@ As first step implement defragmentation during maintenance windows. Subsequently
 
 ### Deployment workflow
 
-![controller-diagram](./docs/controller.png)
+![controller-diagram](./docs/images/controller.png)
 
 ### Defragmentation workflow
 
-![defrag-diagram](./docs/defrag.png)
+![defrag-diagram](./docs/images/defrag.png)
+
+## Local Setup
+
+To setup Etcd-druid locally as a pod running inside a [kind](https://kind.sigs.k8s.io/) cluster, follow this [document](docs/development/getting-started-locally.md)

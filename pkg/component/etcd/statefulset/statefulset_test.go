@@ -23,7 +23,6 @@ import (
 	"github.com/gardener/etcd-druid/pkg/client/kubernetes"
 	"github.com/gardener/etcd-druid/pkg/common"
 	. "github.com/gardener/etcd-druid/pkg/component/etcd/statefulset"
-	"github.com/gardener/etcd-druid/pkg/utils"
 	druidutils "github.com/gardener/etcd-druid/pkg/utils"
 	testutils "github.com/gardener/etcd-druid/test/utils"
 
@@ -63,8 +62,9 @@ var (
 	backupPort              int32 = 8080
 	wrapperPort             int32 = 9095
 	uid                           = "a9b8c7d6e5f4"
-	imageEtcd                     = "eu.gcr.io/gardener-project/gardener/etcd-wrapper:v0.1.0"
-	imageBR                       = "eu.gcr.io/gardener-project/gardener/etcdbrctl:v0.25.0"
+	imageEtcd                     = "europe-docker.pkg.dev/gardener-project/releases/gardener/etcd-wrapper:v0.1.0"
+	imageBR                       = "europe-docker.pkg.dev/gardener-project/releases/gardener/etcdbrctl:v0.25.0"
+	imageInitContainer            = "europe-docker.pkg.dev/gardener-project/releases/3rd/alpine:3.18.4"
 	snapshotSchedule              = "0 */24 * * *"
 	defragSchedule                = "0 */24 * * *"
 	container                     = "default.bkp"
@@ -76,7 +76,7 @@ var (
 	autoCompactionRetention       = "2m"
 	quota                         = resource.MustParse("8Gi")
 	prefix                        = "/tmp"
-	volumeClaimTemplateName       = "etcd-main"
+	volumeClaimTemplateName       = "etcd-test"
 	garbageCollectionPolicy       = druidv1alpha1.GarbageCollectionPolicy(druidv1alpha1.GarbageCollectionPolicyExponential)
 	metricsBasic                  = druidv1alpha1.Basic
 	etcdSnapshotTimeout           = metav1.Duration{
@@ -117,6 +117,7 @@ var _ = Describe("Statefulset", func() {
 	var (
 		ctx context.Context
 		cl  client.Client
+		err error
 
 		etcd      *druidv1alpha1.Etcd
 		namespace string
@@ -125,7 +126,7 @@ var _ = Describe("Statefulset", func() {
 		replicas *int32
 		sts      *appsv1.StatefulSet
 
-		values      Values
+		values      *Values
 		stsDeployer component.Deployer
 
 		storageProvider *string
@@ -133,21 +134,23 @@ var _ = Describe("Statefulset", func() {
 
 	JustBeforeEach(func() {
 		etcd = getEtcd(name, namespace, true, *replicas, storageProvider)
-		values = GenerateValues(
+		values, err = GenerateValues(
 			etcd,
 			pointer.Int32(clientPort),
 			pointer.Int32(serverPort),
 			pointer.Int32(backupPort),
 			imageEtcd,
 			imageBR,
+			imageInitContainer,
 			checkSumAnnotations,
 			false,
 			true,
 		)
+		Expect(err).ToNot(HaveOccurred())
 		fg := map[featuregate.Feature]bool{
 			"UseEtcdWrapper": true,
 		}
-		stsDeployer = New(cl, logr.Discard(), values, fg)
+		stsDeployer = New(cl, logr.Discard(), *values, fg)
 
 		sts = &appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{
@@ -176,29 +179,45 @@ var _ = Describe("Statefulset", func() {
 
 	Describe("#Deploy", func() {
 		Context("when statefulset does not exist", func() {
-			It("should create the statefulset successfully", func() {
-				Expect(stsDeployer.Deploy(ctx)).To(Succeed())
-
-				sts := &appsv1.StatefulSet{}
-
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
-				checkStatefulset(sts, values)
-			})
-
-			Context("should bootstrap a multi replica statefulset successfully", func() {
-				BeforeEach(func() {
-					replicas = pointer.Int32(3)
-				})
-
+			Context("bootstrap of a single replica statefulset", func() {
 				It("should create the statefulset successfully", func() {
 					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
 
 					sts := &appsv1.StatefulSet{}
 
 					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
-					checkStatefulset(sts, values)
-					// ensure that annotation gardener.cloud/scaled-to-multi-node is not there
-					Expect(metav1.HasAnnotation(sts.ObjectMeta, "gardener.cloud/scaled-to-multi-node")).To(BeFalse())
+					checkStatefulset(sts, *values)
+				})
+			})
+
+			Context("bootstrap of a multi replica statefulset", func() {
+				BeforeEach(func() {
+					replicas = pointer.Int32(3)
+				})
+				It("should create the statefulset successfully", func() {
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					sts := &appsv1.StatefulSet{}
+
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
+					checkStatefulset(sts, *values)
+					// ensure that scale-up annotation "gardener.cloud/scaled-to-multi-node" is not there
+					Expect(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeFalse())
+				})
+			})
+
+			Context("DeltaSnapshotRetentionPeriod field is set in Etcd CRD", func() {
+				It("should include --delta-snapshot-retention-period flag in etcd-backup-restore container command", func() {
+					etcd.Spec.Backup.DeltaSnapshotRetentionPeriod = &metav1.Duration{Duration: time.Hour * 24}
+					fg := map[featuregate.Feature]bool{
+						"UseEtcdWrapper": true,
+					}
+					stsDeployer = New(cl, logr.Discard(), *values, fg)
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					updatedSts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+					checkStatefulset(updatedSts, *values)
 				})
 			})
 		})
@@ -211,17 +230,134 @@ var _ = Describe("Statefulset", func() {
 
 				Expect(stsDeployer.Deploy(ctx)).To(Succeed())
 
-				sts := &appsv1.StatefulSet{}
+				updatedSts := &appsv1.StatefulSet{}
 
-				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
-				checkStatefulset(sts, values)
+				Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+				checkStatefulset(updatedSts, *values)
 			})
 
 			Context("when multi-node cluster is configured", func() {
+				var (
+					annotations = make(map[string]string)
+				)
 				BeforeEach(func() {
 					replicas = pointer.Int32(3)
+					annotations = map[string]string{
+						ScaleToMultiNodeAnnotationKey: "",
+					}
 				})
 
+				It("should add scale-up annotation to statefulset", func() {
+					sts.Generation = 1
+					sts.Spec.Replicas = pointer.Int32(1)
+					sts.Status.AvailableReplicas = 1
+					Expect(cl.Create(ctx, sts)).To(Succeed())
+					Expect(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeFalse())
+
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+					updatedSts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+					checkStatefulset(updatedSts, *values)
+					// ensure that scale-up annotation "gardener.cloud/scaled-to-multi-node" should be added to statefulset.
+					Expect(metav1.HasAnnotation(updatedSts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+				})
+				It("shouldn't remove the scale-up annotation from statefulset if scale-up is not completed yet", func() {
+					sts = &appsv1.StatefulSet{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      values.Name,
+							Namespace: values.Namespace,
+							// add the scale-up annotation to statefulset
+							Annotations: annotations,
+						},
+						Spec: appsv1.StatefulSetSpec{
+							Replicas: pointer.Int32(3),
+						},
+						Status: appsv1.StatefulSetStatus{
+							// assuming scale-up isn't completed yet, hence
+							// set the UpdatedReplicas to 2
+							UpdatedReplicas:   2,
+							AvailableReplicas: 3,
+							Replicas:          3,
+						},
+					}
+
+					Expect(cl.Create(ctx, sts)).To(Succeed())
+					Expect(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					updatedSts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+					checkStatefulset(updatedSts, *values)
+					// ensure that scale-up annotation "gardener.cloud/scaled-to-multi-node"
+					// shouldn't be removed from statefulset until scale-up succeeds.
+					Expect(metav1.HasAnnotation(updatedSts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+				})
+				It("shouldn't remove the scale-up annotation from statefulset if scale-up is not successful yet", func() {
+					sts = &appsv1.StatefulSet{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      values.Name,
+							Namespace: values.Namespace,
+							// add the scale-up annotation to statefulset
+							Annotations: annotations,
+						},
+						Spec: appsv1.StatefulSetSpec{
+							Replicas: pointer.Int32(3),
+						},
+						Status: appsv1.StatefulSetStatus{
+							// assuming scale-up isn't successful yet, hence
+							// set the UpdatedReplicas to 3 as pod spec has been updated for all members,
+							// but set AvailableReplicas is 2 as one pod member unable to come-up.
+							UpdatedReplicas:   3,
+							AvailableReplicas: 2,
+							Replicas:          3,
+						},
+					}
+
+					Expect(cl.Create(ctx, sts)).To(Succeed())
+					Expect(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					updatedSts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+					checkStatefulset(updatedSts, *values)
+					// ensure that scale-up annotation "gardener.cloud/scaled-to-multi-node"
+					// shouldn't be removed from statefulset until scale-up succeeds.
+					Expect(metav1.HasAnnotation(updatedSts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+				})
+				It("should remove the scale-up annotation from statefulset after scale-up succeeds", func() {
+					sts = &appsv1.StatefulSet{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      values.Name,
+							Namespace: values.Namespace,
+							// add the scale-up annotation to statefulset
+							Annotations: annotations,
+						},
+						Spec: appsv1.StatefulSetSpec{
+							Replicas: pointer.Int32(3),
+						},
+						Status: appsv1.StatefulSetStatus{
+							// scale-up is successful, hence
+							// set the Replicas, UpdatedReplicas and AvailableReplicas to `3`.
+							UpdatedReplicas:   3,
+							AvailableReplicas: 3,
+							Replicas:          3,
+						},
+					}
+
+					Expect(cl.Create(ctx, sts)).To(Succeed())
+					Expect(metav1.HasAnnotation(sts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeTrue())
+
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					updatedSts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
+					checkStatefulset(updatedSts, *values)
+					// After scale-up succeeds ensure that scale-up annotation "gardener.cloud/scaled-to-multi-node"
+					// should be removed from statefulset.
+					Expect(metav1.HasAnnotation(updatedSts.ObjectMeta, ScaleToMultiNodeAnnotationKey)).To(BeFalse())
+				})
 				It("should re-create statefulset because serviceName is changed", func() {
 					sts.Generation = 2
 					sts.Spec.ServiceName = "foo"
@@ -233,7 +369,7 @@ var _ = Describe("Statefulset", func() {
 
 					updatedSts := &appsv1.StatefulSet{}
 					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
-					checkStatefulset(updatedSts, values)
+					checkStatefulset(updatedSts, *values)
 					Expect(updatedSts.Spec.ServiceName).To(Equal(values.PeerServiceName))
 				})
 
@@ -249,8 +385,33 @@ var _ = Describe("Statefulset", func() {
 
 					updatedSts := &appsv1.StatefulSet{}
 					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), updatedSts)).To(Succeed())
-					checkStatefulset(updatedSts, values)
+					checkStatefulset(updatedSts, *values)
 					Expect(updatedSts.Spec.PodManagementPolicy).To(Equal(appsv1.ParallelPodManagement))
+				})
+			})
+
+			Context("DeltaSnapshotRetentionPeriod field is updated in Etcd CRD", func() {
+				It("should update --delta-snapshot-retention-period flag in etcd-backup-restore container command", func() {
+					etcd.Spec.Backup.DeltaSnapshotRetentionPeriod = &metav1.Duration{Duration: time.Hour * 48}
+					values, err = GenerateValues(
+						etcd,
+						pointer.Int32(clientPort),
+						pointer.Int32(serverPort),
+						pointer.Int32(backupPort),
+						imageEtcd,
+						imageBR,
+						imageInitContainer,
+						checkSumAnnotations, false, true)
+					Expect(err).ToNot(HaveOccurred())
+					fg := map[featuregate.Feature]bool{
+						"UseEtcdWrapper": true,
+					}
+					stsDeployer = New(cl, logr.Discard(), *values, fg)
+					Expect(stsDeployer.Deploy(ctx)).To(Succeed())
+
+					sts := &appsv1.StatefulSet{}
+					Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
+					checkStatefulset(sts, *values)
 				})
 			})
 		})
@@ -304,7 +465,7 @@ var _ = Describe("Statefulset", func() {
 					BeforeEach(func() {
 						hostPath = "/data"
 						backupSecretData = map[string][]byte{
-							utils.EtcdBackupSecretHostPath: []byte(hostPath),
+							druidutils.EtcdBackupSecretHostPath: []byte(hostPath),
 						}
 					})
 
@@ -313,7 +474,7 @@ var _ = Describe("Statefulset", func() {
 						sts := &appsv1.StatefulSet{}
 						Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
 
-						checkLocalProviderVaues(etcd, sts, hostPath)
+						checkLocalProviderValues(etcd, sts, hostPath)
 					})
 				})
 
@@ -329,7 +490,7 @@ var _ = Describe("Statefulset", func() {
 						sts := &appsv1.StatefulSet{}
 						Expect(cl.Get(ctx, kutil.Key(namespace, values.Name), sts)).To(Succeed())
 
-						checkLocalProviderVaues(etcd, sts, utils.LocalProviderDefaultMountPath)
+						checkLocalProviderValues(etcd, sts, druidutils.LocalProviderDefaultMountPath)
 					})
 				})
 			})
@@ -394,23 +555,23 @@ func checkBackup(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet) {
 
 	switch *etcd.Spec.Backup.Store.Provider {
 	case druidutils.S3:
-		envVarName = "AWS_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvAWSApplicationCredentials
 
 	case druidutils.ABS:
-		envVarName = "AZURE_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvAzureApplicationCredentials
 
 	case druidutils.GCS:
-		envVarName = "GOOGLE_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvGoogleApplicationCredentials
 		envVarValue = "/var/.gcp/serviceaccount.json"
 
 	case druidutils.Swift:
-		envVarName = "OPENSTACK_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvOpenstackApplicationCredentials
 
 	case druidutils.OSS:
-		envVarName = "ALICLOUD_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvAlicloudApplicationCredentials
 
 	case druidutils.OCS:
-		envVarName = "OPENSHIFT_APPLICATION_CREDENTIALS"
+		envVarName = common.EnvOpenshiftApplicationCredentials
 	}
 
 	// Check env var
@@ -422,13 +583,11 @@ func checkBackup(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet) {
 
 func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 	checkStsOwnerRefs(sts.ObjectMeta.OwnerReferences, values)
-	store, err := druidutils.StorageProviderFromInfraProvider(values.BackupStore.Provider)
-	Expect(err).NotTo(HaveOccurred())
 	Expect(*sts).To(MatchFields(IgnoreExtras, Fields{
 		"ObjectMeta": MatchFields(IgnoreExtras, Fields{
 			"Name":      Equal(values.Name),
 			"Namespace": Equal(values.Namespace),
-			"Annotations": MatchAllKeys(Keys{
+			"Annotations": MatchKeys(IgnoreExtras, Keys{
 				"checksum/etcd-configmap":   Equal("abc123"),
 				"gardener.cloud/owned-by":   Equal(fmt.Sprintf("%s/%s", values.Namespace, values.Name)),
 				"gardener.cloud/owner-type": Equal("etcd"),
@@ -539,42 +698,7 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 						}),
 
 						backupRestore: MatchFields(IgnoreExtras, Fields{
-							"Args": MatchAllElements(cmdIterator, Elements{
-								"server": Equal("server"),
-								"--cert=/var/etcd/ssl/client/client/tls.crt":                       Equal("--cert=/var/etcd/ssl/client/client/tls.crt"),
-								"--key=/var/etcd/ssl/client/client/tls.key":                        Equal("--key=/var/etcd/ssl/client/client/tls.key"),
-								"--cacert=/var/etcd/ssl/client/ca/ca.crt":                          Equal("--cacert=/var/etcd/ssl/client/ca/ca.crt"),
-								"--server-cert=/var/etcd/ssl/client/server/tls.crt":                Equal("--server-cert=/var/etcd/ssl/client/server/tls.crt"),
-								"--server-key=/var/etcd/ssl/client/server/tls.key":                 Equal("--server-key=/var/etcd/ssl/client/server/tls.key"),
-								"--data-dir=/var/etcd/data/new.etcd":                               Equal("--data-dir=/var/etcd/data/new.etcd"),
-								"--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp": Equal("--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp"),
-								"--insecure-transport=false":                                       Equal("--insecure-transport=false"),
-								"--insecure-skip-tls-verify=false":                                 Equal("--insecure-skip-tls-verify=false"),
-								"--snapstore-temp-directory=/var/etcd/data/temp":                   Equal("--snapstore-temp-directory=/var/etcd/data/temp"),
-								fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", etcdLeaderElectionConnectionTimeout.Duration.String()): Equal(fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", values.LeaderElection.EtcdConnectionTimeout.Duration.String())),
-								"--etcd-connection-timeout=5m":                                                                        Equal("--etcd-connection-timeout=5m"),
-								"--enable-snapshot-lease-renewal=true":                                                                Equal("--enable-snapshot-lease-renewal=true"),
-								"--enable-member-lease-renewal=true":                                                                  Equal("--enable-member-lease-renewal=true"),
-								"--k8s-heartbeat-duration=10s":                                                                        Equal("--k8s-heartbeat-duration=10s"),
-								fmt.Sprintf("--defragmentation-schedule=%s", *values.DefragmentationSchedule):                         Equal(fmt.Sprintf("--defragmentation-schedule=%s", *values.DefragmentationSchedule)),
-								fmt.Sprintf("--schedule=%s", *values.FullSnapshotSchedule):                                            Equal(fmt.Sprintf("--schedule=%s", *values.FullSnapshotSchedule)),
-								fmt.Sprintf("%s=%s", "--garbage-collection-policy", *values.GarbageCollectionPolicy):                  Equal(fmt.Sprintf("%s=%s", "--garbage-collection-policy", *values.GarbageCollectionPolicy)),
-								fmt.Sprintf("%s=%s", "--storage-provider", store):                                                     Equal(fmt.Sprintf("%s=%s", "--storage-provider", store)),
-								fmt.Sprintf("%s=%s", "--store-prefix", values.BackupStore.Prefix):                                     Equal(fmt.Sprintf("%s=%s", "--store-prefix", values.BackupStore.Prefix)),
-								fmt.Sprintf("--delta-snapshot-memory-limit=%d", values.DeltaSnapshotMemoryLimit.Value()):              Equal(fmt.Sprintf("--delta-snapshot-memory-limit=%d", values.DeltaSnapshotMemoryLimit.Value())),
-								fmt.Sprintf("--garbage-collection-policy=%s", *values.GarbageCollectionPolicy):                        Equal(fmt.Sprintf("--garbage-collection-policy=%s", *values.GarbageCollectionPolicy)),
-								fmt.Sprintf("--endpoints=https://%s-local:%d", values.Name, clientPort):                               Equal(fmt.Sprintf("--endpoints=https://%s-local:%d", values.Name, clientPort)),
-								fmt.Sprintf("--service-endpoints=https://%s:%d", values.ClientServiceName, clientPort):                Equal(fmt.Sprintf("--service-endpoints=https://%s:%d", values.ClientServiceName, clientPort)),
-								fmt.Sprintf("--embedded-etcd-quota-bytes=%d", int64(values.Quota.Value())):                            Equal(fmt.Sprintf("--embedded-etcd-quota-bytes=%d", int64(values.Quota.Value()))),
-								fmt.Sprintf("%s=%s", "--delta-snapshot-period", values.DeltaSnapshotPeriod.Duration.String()):         Equal(fmt.Sprintf("%s=%s", "--delta-snapshot-period", values.DeltaSnapshotPeriod.Duration.String())),
-								fmt.Sprintf("%s=%s", "--garbage-collection-period", values.GarbageCollectionPeriod.Duration.String()): Equal(fmt.Sprintf("%s=%s", "--garbage-collection-period", values.GarbageCollectionPeriod.Duration.String())),
-								fmt.Sprintf("%s=%s", "--auto-compaction-mode", *values.AutoCompactionMode):                            Equal(fmt.Sprintf("%s=%s", "--auto-compaction-mode", *values.AutoCompactionMode)),
-								fmt.Sprintf("%s=%s", "--auto-compaction-retention", *values.AutoCompactionRetention):                  Equal(fmt.Sprintf("%s=%s", "--auto-compaction-retention", *values.AutoCompactionRetention)),
-								fmt.Sprintf("%s=%s", "--etcd-snapshot-timeout", values.EtcdSnapshotTimeout.Duration.String()):         Equal(fmt.Sprintf("%s=%s", "--etcd-snapshot-timeout", values.EtcdSnapshotTimeout.Duration.String())),
-								fmt.Sprintf("%s=%s", "--etcd-defrag-timeout", values.EtcdDefragTimeout.Duration.String()):             Equal(fmt.Sprintf("%s=%s", "--etcd-defrag-timeout", values.EtcdDefragTimeout.Duration.String())),
-								fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", values.DeltaSnapLeaseName):                        Equal(fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", values.DeltaSnapLeaseName)),
-								fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", values.FullSnapLeaseName):                          Equal(fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", values.FullSnapLeaseName)),
-							}),
+							"Args": MatchAllElements(cmdIterator, expectedBackupArgs(&values)),
 							"Ports": ConsistOf([]corev1.ContainerPort{
 								{
 									Name:          "server",
@@ -600,28 +724,28 @@ func checkStatefulset(sts *appsv1.StatefulSet, values Values) {
 								}),
 							}),
 							"Env": MatchElements(envIterator, IgnoreExtras, Elements{
-								"STORAGE_CONTAINER": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("STORAGE_CONTAINER"),
+								common.EnvStorageContainer: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvStorageContainer),
 									"Value": Equal(*values.BackupStore.Container),
 								}),
-								"POD_NAME": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAME"),
+								common.EnvPodName: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodName),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.name"),
 										})),
 									})),
 								}),
-								"POD_NAMESPACE": MatchFields(IgnoreExtras, Fields{
-									"Name": Equal("POD_NAMESPACE"),
+								common.EnvPodNamespace: MatchFields(IgnoreExtras, Fields{
+									"Name": Equal(common.EnvPodNamespace),
 									"ValueFrom": PointTo(MatchFields(IgnoreExtras, Fields{
 										"FieldRef": PointTo(MatchFields(IgnoreExtras, Fields{
 											"FieldPath": Equal("metadata.namespace"),
 										})),
 									})),
 								}),
-								"AZURE_APPLICATION_CREDENTIALS": MatchFields(IgnoreExtras, Fields{
-									"Name":  Equal("AZURE_APPLICATION_CREDENTIALS"),
+								common.EnvAzureApplicationCredentials: MatchFields(IgnoreExtras, Fields{
+									"Name":  Equal(common.EnvAzureApplicationCredentials),
 									"Value": Equal("/var/etcd-backup"),
 								}),
 							}),
@@ -902,7 +1026,7 @@ func getReadinessHandlerForMultiNode() gomegatypes.GomegaMatcher {
 	})
 }
 
-func checkLocalProviderVaues(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet, hostPath string) {
+func checkLocalProviderValues(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet, hostPath string) {
 	hpt := corev1.HostPathDirectory
 
 	// check volumes
@@ -930,4 +1054,50 @@ func checkLocalProviderVaues(etcd *druidv1alpha1.Etcd, sts *appsv1.StatefulSet, 
 		Name:      "host-storage",
 		MountPath: "/home/nonroot/" + container,
 	}))
+}
+
+func expectedBackupArgs(values *Values) Elements {
+	store, err := druidutils.StorageProviderFromInfraProvider(values.BackupStore.Provider)
+	Expect(err).NotTo(HaveOccurred())
+	elements := Elements{
+		"server": Equal("server"),
+		"--cert=/var/etcd/ssl/client/client/tls.crt":                       Equal("--cert=/var/etcd/ssl/client/client/tls.crt"),
+		"--key=/var/etcd/ssl/client/client/tls.key":                        Equal("--key=/var/etcd/ssl/client/client/tls.key"),
+		"--cacert=/var/etcd/ssl/client/ca/ca.crt":                          Equal("--cacert=/var/etcd/ssl/client/ca/ca.crt"),
+		"--server-cert=/var/etcd/ssl/client/server/tls.crt":                Equal("--server-cert=/var/etcd/ssl/client/server/tls.crt"),
+		"--server-key=/var/etcd/ssl/client/server/tls.key":                 Equal("--server-key=/var/etcd/ssl/client/server/tls.key"),
+		"--data-dir=/var/etcd/data/new.etcd":                               Equal("--data-dir=/var/etcd/data/new.etcd"),
+		"--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp": Equal("--restoration-temp-snapshots-dir=/var/etcd/data/restoration.temp"),
+		"--insecure-transport=false":                                       Equal("--insecure-transport=false"),
+		"--insecure-skip-tls-verify=false":                                 Equal("--insecure-skip-tls-verify=false"),
+		"--snapstore-temp-directory=/var/etcd/data/temp":                   Equal("--snapstore-temp-directory=/var/etcd/data/temp"),
+		fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", etcdLeaderElectionConnectionTimeout.Duration.String()): Equal(fmt.Sprintf("%s=%s", "--etcd-connection-timeout-leader-election", values.LeaderElection.EtcdConnectionTimeout.Duration.String())),
+		"--etcd-connection-timeout=5m":                                                                        Equal("--etcd-connection-timeout=5m"),
+		"--enable-snapshot-lease-renewal=true":                                                                Equal("--enable-snapshot-lease-renewal=true"),
+		"--enable-member-lease-renewal=true":                                                                  Equal("--enable-member-lease-renewal=true"),
+		"--k8s-heartbeat-duration=10s":                                                                        Equal("--k8s-heartbeat-duration=10s"),
+		fmt.Sprintf("--defragmentation-schedule=%s", *values.DefragmentationSchedule):                         Equal(fmt.Sprintf("--defragmentation-schedule=%s", *values.DefragmentationSchedule)),
+		fmt.Sprintf("--schedule=%s", *values.FullSnapshotSchedule):                                            Equal(fmt.Sprintf("--schedule=%s", *values.FullSnapshotSchedule)),
+		fmt.Sprintf("%s=%s", "--garbage-collection-policy", *values.GarbageCollectionPolicy):                  Equal(fmt.Sprintf("%s=%s", "--garbage-collection-policy", *values.GarbageCollectionPolicy)),
+		fmt.Sprintf("%s=%s", "--storage-provider", store):                                                     Equal(fmt.Sprintf("%s=%s", "--storage-provider", store)),
+		fmt.Sprintf("%s=%s", "--store-prefix", values.BackupStore.Prefix):                                     Equal(fmt.Sprintf("%s=%s", "--store-prefix", values.BackupStore.Prefix)),
+		fmt.Sprintf("--delta-snapshot-memory-limit=%d", values.DeltaSnapshotMemoryLimit.Value()):              Equal(fmt.Sprintf("--delta-snapshot-memory-limit=%d", values.DeltaSnapshotMemoryLimit.Value())),
+		fmt.Sprintf("--garbage-collection-policy=%s", *values.GarbageCollectionPolicy):                        Equal(fmt.Sprintf("--garbage-collection-policy=%s", *values.GarbageCollectionPolicy)),
+		fmt.Sprintf("--endpoints=https://%s-local:%d", values.Name, clientPort):                               Equal(fmt.Sprintf("--endpoints=https://%s-local:%d", values.Name, clientPort)),
+		fmt.Sprintf("--service-endpoints=https://%s:%d", values.ClientServiceName, clientPort):                Equal(fmt.Sprintf("--service-endpoints=https://%s:%d", values.ClientServiceName, clientPort)),
+		fmt.Sprintf("--embedded-etcd-quota-bytes=%d", values.Quota.Value()):                                   Equal(fmt.Sprintf("--embedded-etcd-quota-bytes=%d", values.Quota.Value())),
+		fmt.Sprintf("%s=%s", "--delta-snapshot-period", values.DeltaSnapshotPeriod.Duration.String()):         Equal(fmt.Sprintf("%s=%s", "--delta-snapshot-period", values.DeltaSnapshotPeriod.Duration.String())),
+		fmt.Sprintf("%s=%s", "--garbage-collection-period", values.GarbageCollectionPeriod.Duration.String()): Equal(fmt.Sprintf("%s=%s", "--garbage-collection-period", values.GarbageCollectionPeriod.Duration.String())),
+		fmt.Sprintf("%s=%s", "--auto-compaction-mode", *values.AutoCompactionMode):                            Equal(fmt.Sprintf("%s=%s", "--auto-compaction-mode", *values.AutoCompactionMode)),
+		fmt.Sprintf("%s=%s", "--auto-compaction-retention", *values.AutoCompactionRetention):                  Equal(fmt.Sprintf("%s=%s", "--auto-compaction-retention", *values.AutoCompactionRetention)),
+		fmt.Sprintf("%s=%s", "--etcd-snapshot-timeout", values.EtcdSnapshotTimeout.Duration.String()):         Equal(fmt.Sprintf("%s=%s", "--etcd-snapshot-timeout", values.EtcdSnapshotTimeout.Duration.String())),
+		fmt.Sprintf("%s=%s", "--etcd-defrag-timeout", values.EtcdDefragTimeout.Duration.String()):             Equal(fmt.Sprintf("%s=%s", "--etcd-defrag-timeout", values.EtcdDefragTimeout.Duration.String())),
+		fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", values.DeltaSnapLeaseName):                        Equal(fmt.Sprintf("%s=%s", "--delta-snapshot-lease-name", values.DeltaSnapLeaseName)),
+		fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", values.FullSnapLeaseName):                          Equal(fmt.Sprintf("%s=%s", "--full-snapshot-lease-name", values.FullSnapLeaseName)),
+	}
+
+	if values.DeltaSnapshotRetentionPeriod != nil {
+		elements[fmt.Sprintf("--delta-snapshot-retention-period=%s", values.DeltaSnapshotRetentionPeriod.Duration.String())] = Equal(fmt.Sprintf("--delta-snapshot-retention-period=%s", values.DeltaSnapshotRetentionPeriod.Duration.String()))
+	}
+	return elements
 }
