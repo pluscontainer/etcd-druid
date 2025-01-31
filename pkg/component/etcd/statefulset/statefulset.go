@@ -485,25 +485,13 @@ func (c *component) createOrPatch(ctx context.Context, sts *appsv1.StatefulSet, 
 		}
 
 		if sts.Name == "etcd-main" {
-			//ETCd pod
-			sts.Spec.Template.Spec.Containers[0].Lifecycle = &corev1.Lifecycle{
-				PreStop: &corev1.LifecycleHandler{
-					Exec: &corev1.ExecAction{
-						Command: []string{
-							"/bin/bash", "-c",
-							`echo "Taking final snapshot" && curl -k https://localhost:8080/snapshot/full && touch /tmp/etcd-dead`,
-						},
-					},
-				},
-			}
-
 			//Backup restore pod
 			sts.Spec.Template.Spec.Containers[1].Lifecycle = &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{
 					Exec: &corev1.ExecAction{
 						Command: []string{
-							"/bin/bash", "-c",
-							"while ! [ -f /tmp/etcd-dead ]; do echo Waiting for ETCd to stop && sleep 1; done",
+							"/bin/sh", "-c",
+							"echo Waiting for final snapshot to be taken && sleep 10",
 						},
 					},
 				},

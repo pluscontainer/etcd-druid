@@ -117,7 +117,7 @@ generate: set-permissions manifests $(CONTROLLER_GEN) $(GOIMPORTS) $(MOCKGEN)
 # Build the docker image
 .PHONY: docker-build
 docker-build:
-	docker build . -t ${IMG} --rm
+	docker build --platform linux/amd64 . -t ${IMG} --rm
 	@echo "updating kustomize image patch file for manager resource"
 	sed -i'' -e 's@image: .*@image: '"${IMG}"'@' ./config/default/manager_image_patch.yaml
 
