@@ -6,6 +6,7 @@ package statefulset
 
 import (
 	"fmt"
+	"strings"
 
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/core/v1alpha1"
 	"github.com/gardener/etcd-druid/internal/common"
@@ -48,7 +49,14 @@ var (
 	defaultResourceRequirements = corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceCPU:    apiresource.MustParse("50m"),
-			corev1.ResourceMemory: apiresource.MustParse("128Mi"),
+			corev1.ResourceMemory: apiresource.MustParse("256Mi"),
+		},
+	}
+	// FORK
+	etcdMainResourceRequirements = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    apiresource.MustParse("50m"),
+			corev1.ResourceMemory: apiresource.MustParse("3Gi"),
 		},
 	}
 	defaultUpdateStrategy = appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}
@@ -151,6 +159,42 @@ func (b *stsBuilder) createStatefulSetSpec(ctx component.OperatorContext) error 
 			b.sts.Spec.ServiceName = druidv1alpha1.GetPeerServiceName(b.etcd.ObjectMeta)
 		}
 		b.sts.Spec.VolumeClaimTemplates = b.getVolumeClaimTemplates()
+	}
+
+	// FORK
+	//Don't do this for garden cluster as there is no dedicated worker group for etcds
+	//ToDo: Please do this properly :(
+	if !strings.HasPrefix(b.sts.Namespace, "shoot--garden") {
+		//Only schedule on dedicated etcd worker group
+		if b.sts.Spec.Template.Spec.Affinity == nil {
+			b.sts.Spec.Template.Spec.Affinity = &corev1.Affinity{}
+		}
+
+		if b.sts.Spec.Template.Spec.Affinity.NodeAffinity == nil {
+			b.sts.Spec.Template.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "worker.gardener.cloud/pool",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"etcd-workers"},
+								},
+							},
+						},
+					},
+				},
+			}
+		}
+
+		//Add toleration for dedicated etcd worker group taint
+		b.sts.Spec.Template.Spec.Tolerations = append(b.sts.Spec.Template.Spec.Tolerations, corev1.Toleration{
+			Key:      "pske.plusserver.com/purpose",
+			Operator: corev1.TolerationOpEqual,
+			Value:    "etcd",
+			Effect:   corev1.TaintEffectNoSchedule,
+		})
 	}
 	return nil
 }
@@ -354,6 +398,11 @@ func (b *stsBuilder) getEtcdBackupVolumeMount() *corev1.VolumeMount {
 
 func (b *stsBuilder) getEtcdDataVolumeMount() corev1.VolumeMount {
 	volumeClaimTemplateName := ptr.Deref(b.etcd.Spec.VolumeClaimTemplate, b.etcd.Name)
+	// FORK
+	if b.sts.Name == "etcd-main" {
+		volumeClaimTemplateName = "etcd-in-memory"
+	}
+
 	return corev1.VolumeMount{
 		Name:      volumeClaimTemplateName,
 		MountPath: common.VolumeMountPathEtcdData,
@@ -379,13 +428,20 @@ func (b *stsBuilder) getEtcdContainer() corev1.Container {
 				ContainerPort: b.clientPort,
 			},
 		},
-		Resources: ptr.Deref(b.etcd.Spec.Etcd.Resources, defaultResourceRequirements),
+		Resources: b.getEtcdResourceRequirements(),
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
 		},
 		Env:          b.getEtcdContainerEnvVars(),
 		VolumeMounts: b.getEtcdContainerVolumeMounts(),
 	}
+}
+
+func (b *stsBuilder) getEtcdResourceRequirements() corev1.ResourceRequirements {
+	if b.sts.Name == "etcd-main" {
+		return etcdMainResourceRequirements
+	}
+	return ptr.Deref(b.etcd.Spec.Etcd.Resources, defaultResourceRequirements)
 }
 
 func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
@@ -417,6 +473,16 @@ func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
 			AllowPrivilegeEscalation: ptr.To(false),
 		},
 		VolumeMounts: b.getBackupRestoreContainerVolumeMounts(),
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"/bin/sh", "-c",
+						"echo Waiting for final snapshot to be taken && sleep 10",
+					},
+				},
+			},
+		},
 	}, nil
 }
 
@@ -742,6 +808,21 @@ func (b *stsBuilder) getPodVolumes(ctx component.OperatorContext) ([]corev1.Volu
 			volumes = append(volumes, *backupVolume)
 		}
 	}
+
+	// FORK
+	quota := apiresource.MustParse("8Gi")
+	if b.sts.Name == "etcd-main" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "etcd-in-memory",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium:    corev1.StorageMediumMemory,
+					SizeLimit: &quota,
+				},
+			},
+		})
+	}
+
 	return volumes, nil
 }
 
