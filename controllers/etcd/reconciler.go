@@ -188,13 +188,12 @@ func (r *Reconciler) reconcile(ctx context.Context, etcd *druidv1alpha1.Etcd) (c
 		}, err
 	}
 
-	if err = r.removeOperationAnnotation(ctx, logger, etcd); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
+	preReconcileResult := r.preReconcileEtcd(ctx, logger, etcd)
+	if preReconcileResult.err != nil {
+		logger.Error(err, "Error during pre-reconciling ETCD")
 		return ctrl.Result{
 			Requeue: true,
-		}, err
+		}, preReconcileResult.err
 	}
 
 	result := r.reconcileEtcd(ctx, logger, etcd)
@@ -209,7 +208,17 @@ func (r *Reconciler) reconcile(ctx context.Context, etcd *druidv1alpha1.Etcd) (c
 			Requeue: true,
 		}, result.err
 	}
-	if err := r.updateEtcdStatus(ctx, etcd, result); err != nil {
+
+	if err = r.updateEtcdStatus(ctx, etcd, result); err != nil {
+		return ctrl.Result{
+			Requeue: true,
+		}, err
+	}
+
+	if err = r.removeOperationAnnotation(ctx, logger, etcd); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{
 			Requeue: true,
 		}, err
@@ -292,6 +301,15 @@ func (r *Reconciler) delete(ctx context.Context, etcd *druidv1alpha1.Etcd) (ctrl
 	}
 	logger.Info("Deleted etcd successfully", "namespace", etcd.Namespace, "name", etcd.Name)
 	return ctrl.Result{}, nil
+}
+
+func (r *Reconciler) preReconcileEtcd(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) reconcileResult {
+	statefulSetValues := componentsts.GeneratePreDeployValues(etcd)
+	stsDeployer := componentsts.New(r.Client, logger, *statefulSetValues, r.config.FeatureGates)
+	if err := stsDeployer.PreDeploy(ctx, etcd); err != nil {
+		return reconcileResult{err: err}
+	}
+	return reconcileResult{}
 }
 
 func (r *Reconciler) reconcileEtcd(ctx context.Context, logger logr.Logger, etcd *druidv1alpha1.Etcd) reconcileResult {
@@ -396,6 +414,10 @@ func isPeerTLSChangedToEnabled(peerTLSEnabledStatusFromMembers bool, configMapVa
 }
 
 func (r *Reconciler) updateEtcdErrorStatus(ctx context.Context, etcd *druidv1alpha1.Etcd, result reconcileResult) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(etcd), etcd); err != nil {
+		return err
+	}
+
 	lastErrStr := result.err.Error()
 	etcd.Status.LastError = &lastErrStr
 	etcd.Status.ObservedGeneration = &etcd.Generation
@@ -409,6 +431,10 @@ func (r *Reconciler) updateEtcdErrorStatus(ctx context.Context, etcd *druidv1alp
 }
 
 func (r *Reconciler) updateEtcdStatus(ctx context.Context, etcd *druidv1alpha1.Etcd, result reconcileResult) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(etcd), etcd); err != nil {
+		return err
+	}
+
 	if result.sts != nil {
 		ready, _ := druidutils.IsStatefulSetReady(etcd.Spec.Replicas, result.sts)
 		etcd.Status.Ready = &ready
@@ -432,6 +458,10 @@ func (r *Reconciler) removeOperationAnnotation(ctx context.Context, logger logr.
 }
 
 func (r *Reconciler) updateEtcdStatusAsNotReady(ctx context.Context, etcd *druidv1alpha1.Etcd) (*druidv1alpha1.Etcd, error) {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(etcd), etcd); err != nil {
+		return nil, err
+	}
+
 	etcd.Status.Ready = nil
 	etcd.Status.ReadyReplicas = 0
 
