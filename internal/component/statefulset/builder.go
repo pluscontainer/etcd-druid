@@ -467,7 +467,7 @@ func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
 	}
 	env = append(env, providerEnv...)
 
-	return corev1.Container{
+	container := corev1.Container{
 		Name:            common.ContainerNameEtcdBackupRestore,
 		Image:           b.etcdBackupRestoreImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
@@ -482,17 +482,22 @@ func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
 		Env:          env,
 		Resources:    ptr.Deref(b.etcd.Spec.Backup.Resources, defaultResourceRequirements),
 		VolumeMounts: b.getBackupRestoreContainerVolumeMounts(),
-		Lifecycle: &corev1.Lifecycle{
+	}
+
+	if b.sts.Name == "etcd-main" {
+		container.Lifecycle = &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
 					Command: []string{
 						"/bin/sh", "-c",
-						"echo Waiting for final snapshot to be taken && sleep 10",
+						"echo Waiting for final snapshot to be taken && sleep 30",
 					},
 				},
 			},
-		},
-	}, nil
+		}
+	}
+
+	return container, nil
 }
 
 func (b *stsBuilder) getBackupRestoreContainerCommandArgs() []string {
