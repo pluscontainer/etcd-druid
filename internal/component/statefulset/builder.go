@@ -489,7 +489,7 @@ func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
 					Command: []string{
-						"/bin/sh", "-c",
+						"/busybox/sh", "-c",
 						"echo Waiting for final snapshot to be taken && sleep 30",
 					},
 				},
