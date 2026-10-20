@@ -401,8 +401,8 @@ func (b *stsBuilder) getEtcdBackupVolumeMount() *corev1.VolumeMount {
 func (b *stsBuilder) getEtcdDataVolumeMount() corev1.VolumeMount {
 	volumeClaimTemplateName := ptr.Deref(b.etcd.Spec.VolumeClaimTemplate, b.etcd.Name)
 	// FORK
-	if b.sts.Name == "etcd-main" {
-		volumeClaimTemplateName = "etcd-in-memory"
+	if b.etcd.Name == inMemoryEtcdName {
+		volumeClaimTemplateName = inMemoryVolumeName
 	}
 
 	return corev1.VolumeMount{
@@ -475,16 +475,8 @@ func (b *stsBuilder) getBackupRestoreContainer() (corev1.Container, error) {
 			AllowPrivilegeEscalation: ptr.To(false),
 		},
 		VolumeMounts: b.getBackupRestoreContainerVolumeMounts(),
-		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"/bin/sh", "-c",
-						"echo Waiting for final snapshot to be taken && sleep 10",
-					},
-				},
-			},
-		},
+		// FORK
+		Lifecycle: getBackupRestoreLifecycle(),
 	}, nil
 }
 
@@ -819,18 +811,7 @@ func (b *stsBuilder) getPodVolumes(ctx component.OperatorContext) ([]corev1.Volu
 	}
 
 	// FORK
-	quota := apiresource.MustParse("8Gi")
-	if b.sts.Name == "etcd-main" {
-		volumes = append(volumes, corev1.Volume{
-			Name: "etcd-in-memory",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{
-					Medium:    corev1.StorageMediumMemory,
-					SizeLimit: &quota,
-				},
-			},
-		})
-	}
+	volumes = append(volumes, b.getInMemoryVolumes()...)
 
 	return volumes, nil
 }
